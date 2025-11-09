@@ -98,6 +98,121 @@ def is_unlimited(text):
         return False
     return 'onbeperkt' in text.lower() or 'unlimited' in text.lower()
 
+def wait_for_page_load(page, timeout=30000):
+    """Wait minimum 2 seconds and then wait for all loading spinners to disappear."""
+    print("  >> Waiting for page to load (min 2s + no spinners)...")
+    time.sleep(2)  # Minimum 2 seconds
+    
+    # Wait for all spinners to disappear
+    try:
+        start_time = time.time()
+        while time.time() - start_time < timeout / 1000:
+            spinners = page.locator('svg.p-progress-spinner')
+            if spinners.count() == 0:
+                print("  >> Page fully loaded (no spinners)")
+                return True
+            time.sleep(0.3)  # Check every 300ms
+        print("  >> Warning: Timeout waiting for spinners to disappear")
+        return False
+    except Exception as e:
+        print(f"  >> Warning: Error waiting for spinners: {e}")
+        return False
+
+def format_output_structure(products_data, latest_invoice):
+    """Format the extracted data into the desired output structure."""
+    # Process products into structured format
+    formatted_products = []
+    
+    for product in products_data:
+        # Determine product type and ID
+        if "phone_number" in product:
+            product_type = "mobile"
+            # Clean phone number for ID (remove spaces)
+            phone_clean = product["phone_number"].replace(" ", "")
+            product_id = f"mobile_{phone_clean}"
+        elif "easy_switch_number" in product:
+            product_type = "internet"
+            product_id = f"internet_{product['easy_switch_number']}"
+        else:
+            product_type = "unknown"
+            product_id = f"unknown_{product.get('tariff', 'product')}"
+        
+        # Build product structure
+        formatted_product = {
+            "id": product_id,
+            "type": product_type
+        }
+        
+        # Add phone number for mobile
+        if "phone_number" in product:
+            formatted_product["phone_number"] = product["phone_number"]
+        
+        # Add easy switch number for internet
+        if "easy_switch_number" in product:
+            formatted_product["easy_switch_number"] = product["easy_switch_number"]
+        
+        # Add tariff
+        if "tariff" in product:
+            formatted_product["tariff"] = product["tariff"]
+        
+        # Add contract information
+        contract = {}
+        if "contract_start_date" in product:
+            contract["start_date"] = product["contract_start_date"]
+        if "price_per_month_eur" in product:
+            contract["price_per_month_eur"] = product["price_per_month_eur"]
+        
+        if contract:
+            formatted_product["contract"] = contract
+        
+        # Add usage information
+        if "usage" in product:
+            formatted_product["usage"] = product["usage"]
+        
+        formatted_products.append(formatted_product)
+    
+    # Build the final structure
+    result = {
+        "provider": "hey!",
+        "account": {
+            "last_sync": datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        },
+        "products": formatted_products
+    }
+    
+    # Add billing information
+    if latest_invoice:
+        # Generate invoice ID from date if available
+        invoice_id = None
+        if "date" in latest_invoice and latest_invoice["date"]:
+            invoice_id = f"INV-{latest_invoice['date'].replace('-', '')}"
+        
+        billing_info = {
+            "latest_invoice": {}
+        }
+        
+        if invoice_id:
+            billing_info["latest_invoice"]["invoice_id"] = invoice_id
+        
+        if "amount_eur" in latest_invoice:
+            billing_info["latest_invoice"]["amount_eur"] = latest_invoice["amount_eur"]
+        
+        if "status" in latest_invoice:
+            billing_info["latest_invoice"]["status"] = latest_invoice["status"].lower()
+        
+        if "paid" in latest_invoice:
+            billing_info["latest_invoice"]["paid"] = latest_invoice["paid"]
+        
+        if "date" in latest_invoice:
+            billing_info["latest_invoice"]["date"] = latest_invoice["date"]
+        
+        if "due_date" in latest_invoice:
+            billing_info["latest_invoice"]["due_date"] = latest_invoice["due_date"]
+        
+        result["billing"] = billing_info
+    
+    return result
+
 def check_logged_in_and_navigate(page):
     """Check if logged in and navigate to products page if needed."""
     print("Checking if logged in...")
@@ -128,9 +243,7 @@ def main():
         # Navigate to the products page
         print("Navigating to mijn-producten page...")
         page.goto("https://ecare.heytelecom.be/nl/mijn-producten")
-        
-        # Wait for page to load
-        # time.sleep(3)
+        wait_for_page_load(page)
         
         # Check if already logged in
         if not check_logged_in_and_navigate(page):
@@ -145,9 +258,7 @@ def main():
             email_login_btn = page.locator('a#Login_loginByEmail')
             email_login_btn.wait_for(state="visible", timeout=10000)
             email_login_btn.click()
-            
-            # Wait for login form to appear
-            # time.sleep(2)
+            wait_for_page_load(page)
             
             # Fill in email
             print("Filling in email...")
@@ -165,10 +276,7 @@ def main():
             print("Clicking 'Inloggen maar!' button...")
             login_btn = page.locator('button#Login_byEmail_login')
             login_btn.click()
-            
-            # Wait for navigation or error message
-            # time.sleep(3)
-            page.wait_for_load_state("networkidle", timeout=10000)
+            wait_for_page_load(page)
             
             # Check for error message
             error_msg = page.locator('div.error_msgs:has-text("Verkeerde gebruikersnaam en/of wachtwoord")')
@@ -179,13 +287,13 @@ def main():
                 browser.close()
                 return
             
-            # Wait for navigation after login
-            # time.sleep(2)
             # Wait for the Mijn account element to appear (indicates successful login)
             try:
                 page.wait_for_selector('span.p-menuitem-text.ng-star-inserted.button-label:has-text("Mijn account")', timeout=10000)
             except:
                 pass
+            
+            wait_for_page_load(page)
             
             # Verify we're logged in
             print(f"Current URL after login: {page.url}")
@@ -206,11 +314,8 @@ def main():
         
         latest_invoice = extract_latest_invoice(page)
         
-        # Combine all data
-        result_data = {
-            "products": products_data,
-            "latest_invoice": latest_invoice
-        }
+        # Combine all data in the structured format
+        result_data = format_output_structure(products_data, latest_invoice)
         
         # Output as JSON
         print("\n" + "="*60)
@@ -233,7 +338,7 @@ def extract_detailed_usage(page):
     except:
         pass
     
-    # time.sleep(2)
+    wait_for_page_load(page)
     
     # Get the full URL
     current_url = page.url
@@ -243,15 +348,6 @@ def extract_detailed_usage(page):
         return None
     
     usage_data = {}
-    
-    # Extract header information
-    header_number = page.locator('span.iris-consumption__header-number')
-    if header_number.count() > 0:
-        usage_data["number"] = header_number.inner_text()
-    
-    header_tariff = page.locator('span.iris-consumption__header-tariff').first
-    if header_tariff.count() > 0:
-        usage_data["tariff"] = header_tariff.inner_text()
     
     # Extract date range (for mobile)
     date_range = page.locator('p.iris-consumption__main-date-range')
@@ -270,8 +366,8 @@ def extract_detailed_usage(page):
             limit_text = data_limit.inner_text()
             used_text = data_usage.inner_text()
             usage_data["data"] = {
-                "used_gb": parse_data_amount(used_text),
-                "limit_gb": parse_data_amount(limit_text),
+                "used": parse_data_amount(used_text),
+                "limit": parse_data_amount(limit_text),
                 "unlimited": is_unlimited(limit_text),
                 "last_update": parse_last_update(data_update.inner_text() if data_update.count() > 0 else None)
             }
@@ -287,8 +383,8 @@ def extract_detailed_usage(page):
             limit_text = fix_limit.inner_text()
             used_text = fix_usage.inner_text()
             usage_data["data"] = {
-                "used_gb": parse_data_amount(used_text),
-                "limit_gb": parse_data_amount(limit_text),
+                "used": parse_data_amount(used_text),
+                "limit": parse_data_amount(limit_text),
                 "unlimited": is_unlimited(limit_text),
                 "last_update": parse_last_update(fix_update.inner_text() if fix_update.count() > 0 else None)
             }
@@ -304,7 +400,7 @@ def extract_detailed_usage(page):
             limit_text = calls_limit.inner_text()
             used_text = calls_usage.inner_text()
             usage_data["calls"] = {
-                "used_minutes": parse_minutes(used_text),
+                "used": parse_minutes(used_text),
                 "unlimited": is_unlimited(limit_text),
                 "last_update": parse_last_update(calls_update.inner_text() if calls_update.count() > 0 else None)
             }
@@ -320,7 +416,7 @@ def extract_detailed_usage(page):
             limit_text = sms_limit.inner_text()
             used_text = sms_usage.inner_text()
             usage_data["sms_mms"] = {
-                "used_count": parse_sms_count(used_text),
+                "used": parse_sms_count(used_text),
                 "unlimited": is_unlimited(limit_text),
                 "last_update": parse_last_update(sms_update.inner_text() if sms_update.count() > 0 else None)
             }
@@ -331,7 +427,7 @@ def extract_latest_invoice(page):
     """Navigate to invoices page and extract the latest invoice data."""
     print("Navigating to invoices page...")
     page.goto("https://ecare.heytelecom.be/nl/mijn-facturen")
-    # time.sleep(3)
+    wait_for_page_load(page)
     page.wait_for_selector('lib-obe-latest-invoice section.iris-invoice', timeout=10000)
     
     invoice_data = {}
@@ -413,7 +509,7 @@ def extract_and_format_products(page):
     """Extract and format all products from the page and return as list of dicts."""
     
     # Wait for products to load
-    # time.sleep(2)
+    wait_for_page_load(page)
     page.wait_for_selector('li.iris-products__item', timeout=10000)
     
     # Find all product items
@@ -493,7 +589,7 @@ def extract_and_format_products(page):
             
             # Go back to products page
             page.goto("https://ecare.heytelecom.be/nl/mijn-producten")
-            # time.sleep(2)
+            wait_for_page_load(page)
             page.wait_for_selector('li.iris-products__item', timeout=10000)
     
     # Return the collected data
