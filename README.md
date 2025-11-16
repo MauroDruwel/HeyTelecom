@@ -1,6 +1,6 @@
 # HeyTelecom Python Library
 
-<img width="2048" alt="HeyTelecom Banner" src="I'mbusymakingabannerlol" />
+<img width="1280" height="668" alt="HeyTelecom Banner" src="https://github.com/user-attachments/assets/d141fb44-e5c3-48af-a2b0-42ba4d2c510f" />
 
 <p align="center">
   <img alt="PyPI" src="https://img.shields.io/pypi/v/heytelecom"/>
