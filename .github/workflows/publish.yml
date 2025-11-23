@@ -1,8 +1,11 @@
 name: Publish to PyPI
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'v*'
+      - '!docker-v*'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -34,7 +37,6 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
-    if: github.event.release.prerelease == false
     environment: 
       name: pypi
       url: https://pypi.org/p/heytelecom/
