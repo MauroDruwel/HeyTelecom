@@ -1,0 +1,20 @@
+name: HeyTelecom
+version: "1.0.0"
+slug: heytelecom
+description: Access your Hey Telecom account data
+arch:
+  - amd64
+  - aarch64
+url: https://github.com/MauroDruwel/HeyTelecom
+startup: application
+boot: auto
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: API Port
+options:
+  email: ""
+  password: ""
+schema:
+  email: email
+  password: password

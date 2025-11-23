@@ -71,3 +71,6 @@ Thumbs.db
 # Temporary files
 *.log
 *.tmp
+
+# Do not track unsanitized research readme
+research/README.md

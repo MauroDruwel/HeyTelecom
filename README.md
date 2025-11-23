@@ -29,11 +29,32 @@ A Python library for interacting with [Hey Telecom](https://ecare.heytelecom.be)
 - 🎭 Built on Playwright for reliable web automation (headless only)
 - 🔧 Object-oriented API for easy integration
 - 🚀 Chromium browser with automatic dependency installation
+- 🐳 Docker support with Flask REST API
 
 ## Installation
 
+### Python Package
+
 ```bash
 pip install heytelecom
+```
+
+### Docker
+
+```bash
+docker run -d \
+  -p 8099:8099 \
+  -e HEYTELECOM_EMAIL="your@email.com" \
+  -e HEYTELECOM_PASSWORD="your_password" \
+  -v heytelecom-data:/data \
+  ghcr.io/maurodruwel/heytelecom:latest
+```
+
+Or use docker-compose:
+
+```bash
+cd docker
+docker-compose up -d
 ```
 
 ## Quick Start
@@ -270,3 +291,4 @@ MIT License
 ## Support
 
 For issues and questions, please open an issue on the GitHub repository.
+

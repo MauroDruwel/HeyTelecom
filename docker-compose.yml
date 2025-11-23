@@ -1,0 +1,15 @@
+services:
+  heytelecom-addon:
+    image: ghcr.io/maurodruwel/heytelecom-addon:latest
+    container_name: heytelecom-addon
+    ports:
+      - "8099:8099"
+    environment:
+      - HEYTELECOM_EMAIL=your@email.com
+      - HEYTELECOM_PASSWORD=your_password
+    volumes:
+      - heytelecom-data:/data
+    restart: unless-stopped
+
+volumes:
+  heytelecom-data:
