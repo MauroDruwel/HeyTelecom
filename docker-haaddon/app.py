@@ -1,11 +1,20 @@
 import os
+import json
 from flask import Flask, jsonify
 from heytelecom import HeyTelecomClient
 
 app = Flask(__name__)
 
-EMAIL = os.environ.get('HEYTELECOM_EMAIL')
-PASSWORD = os.environ.get('HEYTELECOM_PASSWORD')
+# Read config from Home Assistant options
+try:
+    with open('/data/options.json', 'r') as f:
+        options = json.load(f)
+    EMAIL = options.get('email')
+    PASSWORD = options.get('password')
+except FileNotFoundError:
+    # Fallback to environment variables for testing outside HA
+    EMAIL = os.environ.get('HEYTELECOM_EMAIL')
+    PASSWORD = os.environ.get('HEYTELECOM_PASSWORD')
 
 
 @app.route('/')
