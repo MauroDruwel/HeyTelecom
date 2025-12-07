@@ -39,12 +39,16 @@ This container exposes a simple endpoint that returns **one giant JSON** with ev
 
 ```bash
 docker run -d \
+  --name 23118c7a-heytelecom-addon \
+  --restart unless-stopped \
   -p 8099:8099 \
   -e HEYTELECOM_EMAIL="your@email.com" \
   -e HEYTELECOM_PASSWORD="your_password" \
   -v heytelecom-data:/data \
   ghcr.io/maurodruwel/heytelecom:latest
 ```
+
+💡 **Tip:** The name `23118c7a-heytelecom-addon` is the default hostname the Home Assistant integration looks for. If you are running Home Assistant in Docker (not HAOS), naming it this way makes the integration work out of the box!
 
 ---
 
