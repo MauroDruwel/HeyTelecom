@@ -1,6 +1,7 @@
 <p align="center">
-  <img width="1280" height="668" alt="HeyTelecom Banner" src="https://github.com/user-attachments/assets/d141fb44-e5c3-48af-a2b0-42ba4d2c510f" />
+  <img width="1280" height="668" alt="HeyTelecom Banner" src="https://github.com/user-attachments/assets/e6da23c6-5911-4223-8358-c6856e617e9f" />
 </p>
+
 
 <h1 align="center">📱 HeyTelecom Python Library</h1>
 <p align="center"><b>"I just want my usage data" Edition 🚀</b></p>
@@ -24,7 +25,7 @@
 
 ---
 
-## � Quick Install
+## 📦 Quick Install
 
 For the Pythonistas 🐍:
 
@@ -80,19 +81,6 @@ with HeyTelecomClient(email="your@email.com", password="your_password") as clien
     print(f"You have {len(account_data.products)} products.")
     print(f"Latest invoice: €{account_data.billing.latest_invoice.amount_eur} (Ouch? 💸)")
 ```
-
-### Advanced Stuff (for the brave)
-
-Want to skip the login next time? The library saves your session automatically. 🧠
-
-```python
-# Look ma, no password!
-with HeyTelecomClient() as client:
-    products = client.get_products()
-    print(f"Still got {products[0].usage.data.used}GB used.")
-```
-
----
 
 ## 🤖 How it Works
 
