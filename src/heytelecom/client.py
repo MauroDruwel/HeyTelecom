@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import secrets
 import time
-from datetime import datetime
-from typing import Optional, List
+from typing import Dict, Optional, List
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
+
+log = logging.getLogger(__name__)
 
 from .models import Product, Contract, UsageData, Invoice, AccountData
 
@@ -106,6 +108,7 @@ class HeyTelecomClient:
             }
         )
         self.access_token: Optional[str] = None
+        self._token_obtained_at: float = 0.0
 
     # -- context manager ---------------------------------------------------- #
     def __enter__(self):
@@ -137,6 +140,7 @@ class HeyTelecomClient:
         authorize_url = self._login(return_uri)
         code = self._collect_code(authorize_url)
         self.access_token = self._exchange_token(code, code_verifier)
+        self._token_obtained_at = time.time()
 
     def _start_authorization(self, state, nonce, code_challenge) -> str:
         params = {
@@ -255,7 +259,19 @@ class HeyTelecomClient:
     # Authenticated BFF data calls
     # ====================================================================== #
 
+    TOKEN_LIFETIME = 3300  # ~55 min, slightly under the 1-hour OAuth2 lifetime
+
+    def _ensure_token(self) -> None:
+        """Re-login if the access token has expired."""
+        if not self.access_token:
+            return
+        age = time.time() - self._token_obtained_at
+        if age > self.TOKEN_LIFETIME:
+            log.warning("Access token expired (%.0fs old), re-authenticating", age)
+            self.login()
+
     def _bff_headers(self, extra: Optional[dict] = None) -> dict:
+        self._ensure_token()
         if not self.access_token:
             raise RuntimeError("Not authenticated - call login() first.")
         headers = {
@@ -280,7 +296,14 @@ class HeyTelecomClient:
             headers=self._bff_headers(extra_headers),
         )
         resp.raise_for_status()
-        return resp.json()
+        try:
+            return resp.json()
+        except requests.exceptions.JSONDecodeError:
+            raise RuntimeError(
+                f"Expected JSON from {path} but got content-type "
+                f"{resp.headers.get('content-type', '?')!r} — possible "
+                "Incapsula/Imperva challenge page."
+            )
 
     # ====================================================================== #
     # Public API — same interface as the old Playwright client
@@ -301,7 +324,6 @@ class HeyTelecomClient:
             product_type_raw = item.get("productType", "")
             price_info = item.get("price", {})
             price_value = price_info.get("value")
-            price_unit = price_info.get("unit", "EUR")
 
             # Map API productType to old library conventions
             if product_type_raw == "M":
@@ -353,9 +375,8 @@ class HeyTelecomClient:
         """
         try:
             data = self._get("/api/bff/invoice/v1/latest")
-        except Exception:
-            # Endpoint may not exist or may have a different path; return None
-            # rather than crashing so the rest of the library still works.
+        except Exception as exc:
+            log.warning("Failed to fetch latest invoice: %s", exc)
             return None
 
         if not data:
@@ -412,7 +433,8 @@ class HeyTelecomClient:
                 params={"timestamp": int(time.time() * 1000)},
                 extra_headers={"x-req-msisdn": msisdn},
             )
-        except Exception:
+        except Exception as exc:
+            log.warning("Failed to fetch usage for %s: %s", msisdn, exc)
             return None
 
         balances = data.get("BalancePresentation", [])
