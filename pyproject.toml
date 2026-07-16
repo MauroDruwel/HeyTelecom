@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heytelecom"
-version = "0.1.1"
-description = "A Python library for interacting with Hey Telecom accounts"
+version = "0.2.0"
+description = "A Python library for interacting with Hey Telecom accounts (no browser required)"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.8"
 authors = [
-    {name = "CoderMauro", email = "mauro.druwel@gmail.com"}
+    {name = "Mauro Druwel"}
 ]
 keywords = ["hey", "telecom", "hey!", "belgium", "mobile", "internet"]
 classifiers = [
@@ -26,7 +26,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "playwright",
+    "requests>=2.28",
 ]
 
 [project.optional-dependencies]
@@ -42,5 +42,4 @@ Repository = "https://github.com/maurodruwel/heytelecom"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[project.scripts]
-heytelecom-install = "heytelecom.installer:main"
+
