@@ -1,14 +1,14 @@
 """
 Hey Telecom Python Library
 
-A Python library for interacting with Hey Telecom accounts using Playwright.
+A Python library for interacting with Hey Telecom accounts using
+requests + OAuth2/PKCE (no browser required).
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 from .client import HeyTelecomClient
 from .models import Product, Contract, UsageData, Invoice, AccountData
-from .installer import install_playwright, ensure_playwright_installed
 
 __all__ = [
     "HeyTelecomClient",
@@ -17,6 +17,4 @@ __all__ = [
     "UsageData",
     "Invoice",
     "AccountData",
-    "install_playwright",
-    "ensure_playwright_installed",
 ]

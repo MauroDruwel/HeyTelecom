@@ -10,11 +10,12 @@ This example demonstrates how to use the HeyTelecomClient to:
 """
 
 import json
+import os
+import traceback
 from heytelecom import HeyTelecomClient
 
-# Hard-coded credentials (replace with your own or pass as arguments)
-EMAIL = ""  # Replace with your actual email
-PASSWORD = ""  # Replace with your actual password
+EMAIL = os.environ.get("HEY_EMAIL", "")
+PASSWORD = os.environ.get("HEY_PASSWORD", "")
 
 
 def main():
@@ -22,28 +23,25 @@ def main():
     print("=" * 60)
     print("Hey Telecom Library Example")
     print("=" * 60)
-    
-    # Create client - credentials are optional if session already exists
-    # Browser always runs in headless mode (no GUI)
-    # Chromium is automatically installed if not present
+
     with HeyTelecomClient(email=EMAIL, password=PASSWORD) as client:
-        # Login (only needed first time or if session expired)
         if EMAIL and PASSWORD:
-            print("\n📝 Logging in...")
+            print("\nLogging in...")
             try:
                 client.login()
-                print("✓ Login successful!")
+                print("Login successful!")
             except Exception as e:
-                print(f"✗ Login failed: {e}")
+                print(f"Login failed: {e}")
                 return
-        
-        # Get all account data
-        print("\n📊 Fetching account data...")
+        else:
+            print("No credentials provided. Set HEY_EMAIL and HEY_PASSWORD.")
+            return
+
+        print("\nFetching account data...")
         try:
             account_data = client.get_account_data()
-            print(f"✓ Found {len(account_data.products)} product(s)")
-            
-            # Display products
+            print(f"Found {len(account_data.products)} product(s)")
+
             print("\n" + "=" * 60)
             print("PRODUCTS")
             print("=" * 60)
@@ -51,21 +49,25 @@ def main():
                 print(f"\nProduct {i}:")
                 print(f"  Type: {product.product_type}")
                 print(f"  Tariff: {product.tariff}")
-                # Note: Displaying phone number and account details for demonstration purposes
                 if product.phone_number:
                     print(f"  Phone: {product.phone_number}")
                 if product.easy_switch_number:
                     print(f"  Easy Switch: {product.easy_switch_number}")
                 if product.contract:
-                    print(f"  Contract Start: {product.contract.start_date}")
-                    print(f"  Price: {product.contract.price_per_month_eur} EUR/month")
+                    if product.contract.price_per_month_eur is not None:
+                        print(f"  Price: {product.contract.price_per_month_eur:.2f} EUR/month")
                 if product.usage:
                     usage = product.usage.to_dict()
                     if "data" in usage:
                         data = usage["data"]
-                        print(f"  Data Usage: {data.get('used')} / {data.get('limit')} GB")
-            
-            # Display latest invoice
+                        used = data.get("used")
+                        limit = data.get("limit")
+                        unlimited = data.get("unlimited", False)
+                        if unlimited:
+                            print(f"  Data Usage: {used} GB (unlimited)")
+                        else:
+                            print(f"  Data Usage: {used} / {limit} GB")
+
             if account_data.latest_invoice:
                 print("\n" + "=" * 60)
                 print("LATEST INVOICE")
@@ -76,19 +78,17 @@ def main():
                 print(f"  Paid: {'Yes' if invoice.paid else 'No'}")
                 print(f"  Date: {invoice.date}")
                 print(f"  Due Date: {invoice.due_date}")
-            
-            # Display as JSON
+
             print("\n" + "=" * 60)
             print("JSON OUTPUT")
             print("=" * 60)
             print(json.dumps(account_data.to_dict(), indent=2, ensure_ascii=False))
-            
+
         except Exception as e:
-            print(f"✗ Error fetching data: {e}")
-            import traceback
+            print(f"Error fetching data: {e}")
             traceback.print_exc()
-    
-    print("\n✓ Example completed!")
+
+    print("\nExample completed!")
 
 
 if __name__ == "__main__":

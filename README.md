@@ -33,38 +33,16 @@ For the Pythonistas 🐍:
 pip install heytelecom
 ```
 
-For the Container lovers 🐳:
-
-This container exposes a simple endpoint that returns **one giant JSON** with everything you need. It was born to serve the Home Assistant add-on, but hey, free JSON is free JSON.
-
-```bash
-docker run -d \
-  --name 23118c7a-heytelecom-addon \
-  --restart unless-stopped \
-  -p 8099:8099 \
-  -e HEYTELECOM_EMAIL="your@email.com" \
-  -e HEYTELECOM_PASSWORD="your_password" \
-  -v heytelecom-data:/data \
-  ghcr.io/maurodruwel/heytelecom:latest
-```
-
-💡 **Tip:** The name `23118c7a-heytelecom-addon` is the default hostname the Home Assistant integration looks for. If you are running Home Assistant in Docker (not HAOS), naming it this way makes the integration work out of the box!
-
 ---
 
 ## 🏠 Home Assistant Integration
 
-This whole project was basically an excuse to get my data into Home Assistant. 😅
+This whole project was basically an excuse to get my data into Home Assistant.
 
-**The Problem:** You can't just run Playwright inside a standard Home Assistant integration. It's too heavy, requires a browser, and HA generally says "no thanks" to that. 🚫
-
-**The Solution:** I split it up!
-1.  **The Add-on**: A Docker container that runs Playwright and does the heavy lifting (scraping). It exposes the data as JSON.
-    *   👉 [Get the Add-on here](https://github.com/maurodruwel/addons)
-2.  **The Integration**: A lightweight component that talks to the Add-on and creates sensors in HA.
+**How it works now:**
+1. **The Library**: Pure Python — no browser, no heavy dependencies. Just `requests` + OAuth2.
+2. **The Integration**: A lightweight HA component that talks to the library and creates sensors.
     *   👉 [Get the Integration here](https://github.com/maurodruwel/heytelecomha)
-
-It's the easiest way to get your "Hey!" usage on your dashboard without breaking your HA install.
 
 ---
 
@@ -88,35 +66,30 @@ with HeyTelecomClient(email="your@email.com", password="your_password") as clien
 
 ## 🤖 How it Works
 
-1. **The Setup**: We use **Playwright** (a headless browser) to pretend to be a real human. 🎭
-2. **The Login**: It goes to the website, types in your stuff, and handles the session.
-3. **The Grab**: It scrapes the mobile/internet usage, invoices, and contract details.
-4. **The Result**: You get nice, clean Python objects to play with. No more parsing HTML yourself! 🤢
-
-**Note:** The first time you run it, it might take a sec to download the browser. It's automatic, don't panic. 😱
+1. **The Setup**: We use **requests** (plain HTTP) — no browser needed. Just OAuth2 with PKCE, exactly like the web app does.
+2. **The Login**: Authenticates via the same OIDC flow the browser uses — email/password → BFF auth endpoint → authorization code → access token.
+3. **The Grab**: Calls the same BFF JSON APIs the web app uses to get products, usage, and invoices.
+4. **The Result**: You get nice, clean Python objects to play with. No more parsing HTML yourself!
 
 ---
 
 ## ✨ Features
 
-- 🔐 **Auto Login**: Handles the boring auth stuff.
-- 💾 **Session Saving**: Remembers you so it doesn't have to login every single time. Smart.
-- 📱 **Product Info**: Mobile, Internet, whatever you got.
-- 📊 **Usage Stats**: Data, Calls, SMS. Know when to stop scrolling TikTok.
-- 💰 **Invoices**: Download them, track them, pay them (well, you still have to pay them).
-- 🐳 **Docker Ready**: Comes with a REST API if you're into that.
+- **Auto Login**: Handles the OAuth2/PKCE auth flow automatically.
+- **Token Refresh**: Re-authenticates transparently when the access token expires.
+- **Product Info**: Mobile, Internet, whatever you got.
+- **Usage Stats**: Data, Calls, SMS. Know when to stop scrolling TikTok.
+- **Invoices**: Track your latest invoice status.
 
 ---
 
 ## 📖 The Story (or "Why?")
 
-So, here's the tea ☕. I wanted to integrate my mobile usage into my dashboard. I checked for an API. *Crickets*. 🦗
+So, here's the tea. I wanted to integrate my mobile usage into my dashboard. I checked for an API. Crickets.
 
-The official API is not open source and was extremely difficult to reverse engineer. I did some digging though (see the [research folder](./research) if you're curious), but ultimately Playwright was the more reliable path.
+The official API is not public, but I reverse-engineered the web app's traffic using a HAR capture (see the [research folder](./research)). The e-care portal uses standard OAuth2/PKCE + a set of BFF JSON endpoints, so I rebuilt the whole flow with plain HTTP requests — no browser required.
 
-I didn't want to manually check the website every time I was curious about my data cap. That's what robots are for! So I built this wrapper around Playwright to do the heavy lifting. It spins up a browser in the background (headless, so no popping windows to annoy you), logs in, and scrapes the data.
-
-Now I can graph my data usage and feel guilty about it in real-time. 📈
+Now I can graph my data usage and feel guilty about it in real-time.
 
 ---
 

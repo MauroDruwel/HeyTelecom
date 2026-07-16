@@ -1,500 +1,505 @@
-"""Hey Telecom client for accessing mobile usage information."""
+"""Hey Telecom client using requests + OAuth2/PKCE (no browser required)."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import logging
+import secrets
 import time
-from typing import Optional, Dict, Any, List
-from playwright.sync_api import sync_playwright, Browser, Page, BrowserContext
+from typing import Dict, Optional, List
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import requests
+
+log = logging.getLogger(__name__)
 
 from .models import Product, Contract, UsageData, Invoice, AccountData
-from .parsers import (
-    parse_data_amount, parse_price, parse_date, parse_period,
-    parse_minutes, parse_sms_count, parse_last_update, is_unlimited
+
+
+# --------------------------------------------------------------------------- #
+# Constants (public client-side values from the web app)
+# --------------------------------------------------------------------------- #
+CLIENT_ID = "4x5cSOWeuG"
+REDIRECT_URI = "https://ecare.heytelecom.be/index.html"
+SCOPE = "openid ecare"
+
+OPENID_BASE = "https://openid.heytelecom.be"
+API_BASE = "https://api.heytelecom.be"
+
+API_KEY_LOGIN = "ST70c4jIzkKpGTf0cIGbVZLRN7VMhGl0mzLp8D3vEe79oNaK"
+API_KEY_DATA = "KEQRymGhNEonxo79zqM40tphE7zk5NxHOGxjbVsrzsbrkpIs"
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 )
+SEC_CH_UA = '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"'
 
 
+# --------------------------------------------------------------------------- #
+# PKCE helpers
+# --------------------------------------------------------------------------- #
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _generate_pkce() -> tuple[str, str]:
+    """Return (code_verifier, code_challenge) using the S256 method."""
+    code_verifier = _b64url(secrets.token_bytes(48))
+    code_challenge = _b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
+    return code_verifier, code_challenge
+
+
+def _normalize_msisdn(msisdn: str) -> str:
+    """04XXXXXXXX -> 324XXXXXXXX (drop leading 0, prefix country code 32)."""
+    msisdn = msisdn.strip()
+    if msisdn.startswith("0") and not msisdn.startswith("00"):
+        return "32" + msisdn[1:]
+    return msisdn
+
+
+def _format_msisdn(msisdn: str) -> str:
+    """324XXXXXXXX -> 04XXXXXXXX (prefix with 0, drop country code)."""
+    msisdn = msisdn.strip()
+    if msisdn.startswith("32") and len(msisdn) > 2:
+        return "0" + msisdn[2:]
+    return msisdn
+
+
+# --------------------------------------------------------------------------- #
+# Client
+# --------------------------------------------------------------------------- #
 class HeyTelecomClient:
-    """Client for interacting with Hey Telecom account."""
+    """Client for interacting with Hey Telecom accounts.
 
-    BASE_URL = "https://ecare.heytelecom.be"
-    AUTH_URL = "https://auth.heytelecom.be"
+    Uses the same OAuth2/PKCE + BFF API flow as the web app, but without a
+    browser.  Supports the context-manager protocol::
 
-    def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
-                 user_data_dir: str = "hey_browser_data", auto_install: bool = True):
-        """
-        Initialize Hey Telecom client.
+        with HeyTelecomClient(email="...", password="...") as client:
+            client.login()
+            data = client.get_account_data()
+    """
+
+    def __init__(
+        self,
+        email: Optional[str] = None,
+        password: Optional[str] = None,
+        **_kwargs,
+    ):
+        """Initialise the client.
 
         Args:
-            email: Email address for login (optional if already logged in)
-            password: Password for login (optional if already logged in)
-            user_data_dir: Directory to store browser session data
-            auto_install: Automatically install Playwright chromium if not found (default: True)
-        
-        Note:
-            Browser always runs in headless mode (no GUI).
+            email: Account email address.
+            password: Account password.
+            **_kwargs: Ignored (kept for backward compatibility with the old
+                Playwright-based constructor which accepted ``user_data_dir``
+                and ``auto_install``).
         """
         self.email = email
         self.password = password
-        self.user_data_dir = user_data_dir
-        self.auto_install = auto_install
-        self.headless = True  # Always run headless
-        self._playwright = None
-        self._browser: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "nl-BE,nl;q=0.9",
+                "sec-ch-ua": SEC_CH_UA,
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            }
+        )
+        self.access_token: Optional[str] = None
+        self._token_obtained_at: float = 0.0
 
+    # -- context manager ---------------------------------------------------- #
     def __enter__(self):
-        """Context manager entry."""
-        self.connect()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
         self.close()
 
-    def connect(self):
-        """Start browser and create page."""
-        # Ensure Playwright chromium is installed before connecting
-        if self.auto_install:
-            from .installer import ensure_playwright_installed
-            ensure_playwright_installed()
-        
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch_persistent_context(
-            user_data_dir=self.user_data_dir,
-            headless=self.headless
-        )
-        self._page = self._browser.new_page()
-
     def close(self):
-        """Close browser and cleanup."""
-        if self._browser:
-            self._browser.close()
-        if self._playwright:
-            self._playwright.stop()
+        """Close the underlying requests session."""
+        self.session.close()
 
-    def _handle_cookie_popup(self):
-        """Check for and handle cookie popup if present."""
-        if not self._page:
-            return False
-        
-        try:
-            reject_button = self._page.locator('button#onetrust-reject-all-handler')
-            if reject_button.count() > 0:
-                reject_button.click()
-                time.sleep(0.5)  # Reduced from 1 second
-                return True
-        except:
-            pass
-        return False
+    # ====================================================================== #
+    # OAuth2 / PKCE login flow (from test.py)
+    # ====================================================================== #
 
-    def _wait_for_page_load(self, timeout: int = 30000):
-        """Wait for page to load completely."""
-        if not self._page:
-            raise RuntimeError("Browser not connected. Call connect() first.")
-        
-        time.sleep(1)  # Minimum 1 second (reduced from 2)
-        
-        # Wait for all spinners to disappear
-        try:
-            start_time = time.time()
-            while time.time() - start_time < timeout / 1000:
-                spinners = self._page.locator('svg.p-progress-spinner')
-                if spinners.count() == 0:
-                    return True
-                time.sleep(0.2)  # Check every 200ms (reduced from 300ms)
-            return False
-        except Exception:
-            return False
-
-    def _check_logged_in(self) -> bool:
-        """Check if user is logged in."""
-        if not self._page:
-            return False
-        
-        mijn_account = self._page.locator('span.p-menuitem-text.ng-star-inserted.button-label:has-text("Mijn account")')
-        return mijn_account.count() > 0
-
-    def login(self):
-        """
-        Login to Hey Telecom account.
-        
-        Raises:
-            ValueError: If email or password not provided
-            RuntimeError: If login fails
-        """
-        if not self._page:
-            raise RuntimeError("Browser not connected. Call connect() first.")
-        
-        # Navigate to products page
-        self._page.goto(f"{self.BASE_URL}/nl/mijn-producten")
-        self._wait_for_page_load()
-        
-        # Check if already logged in (before handling cookies)
-        if self._check_logged_in():
-            return
-        
+    def login(self) -> None:
+        """Run the full OAuth2/PKCE + credential login flow."""
         if not self.email or not self.password:
             raise ValueError("Email and password required for login")
-        
-        # Wait for redirect to auth page
-        self._page.wait_for_url(f"**{self.AUTH_URL}/**", timeout=10000)
-        
-        # Click on "Inloggen via E-mail" button
-        email_login_btn = self._page.locator('a#Login_loginByEmail')
-        email_login_btn.wait_for(state="visible", timeout=10000)
-        email_login_btn.click()
-        self._wait_for_page_load()
-        
-        # Fill in email
-        email_input = self._page.locator('input#Login_byEmail_emailAddress')
-        email_input.wait_for(state="visible", timeout=10000)
-        email_input.fill(self.email)
-        
-        # Fill in password
-        password_input = self._page.locator('input#Login_byEmail_password')
-        password_input.wait_for(state="visible", timeout=10000)
-        password_input.fill(self.password)
-        
-        # Click login button
-        login_btn = self._page.locator('button#Login_byEmail_login')
-        login_btn.click()
-        self._wait_for_page_load()
-        
-        # Check for error message
-        error_msg = self._page.locator('div.error_msgs:has-text("Verkeerde gebruikersnaam en/of wachtwoord")')
-        if error_msg.count() > 0:
-            raise RuntimeError("Login failed: Wrong username and/or password")
-        
-        # Wait for successful login
+
+        self.session.cookies.clear()
+        code_verifier, code_challenge = _generate_pkce()
+        state = nonce = _b64url(secrets.token_bytes(33))
+
+        transaction_id = self._start_authorization(state, nonce, code_challenge)
+        return_uri = self._build_return_uri(
+            state, nonce, code_challenge, transaction_id
+        )
+        authorize_url = self._login(return_uri)
+        code = self._collect_code(authorize_url)
+        self.access_token = self._exchange_token(code, code_verifier)
+        self._token_obtained_at = time.time()
+
+    def _start_authorization(self, state, nonce, code_challenge) -> str:
+        params = {
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "state": state,
+            "redirect_uri": REDIRECT_URI,
+            "scope": SCOPE,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "nonce": nonce,
+            "ui_locales": "nl",
+        }
+        resp = self.session.get(
+            f"{OPENID_BASE}/oidc/authorize",
+            params=params,
+            allow_redirects=False,
+        )
+        location = resp.headers.get("Location", "")
+        return_uri = parse_qs(urlparse(location).query).get("returnUri", [""])[0]
+        transaction_id = parse_qs(urlparse(return_uri).query).get(
+            "transactionId", [""]
+        )[0]
+        if not transaction_id:
+            raise RuntimeError(
+                f"Could not obtain transactionId (status {resp.status_code}, "
+                f"location={location!r})"
+            )
+        return transaction_id
+
+    @staticmethod
+    def _build_return_uri(state, nonce, code_challenge, transaction_id) -> str:
+        query = urlencode(
+            {
+                "response_type": "code",
+                "client_id": CLIENT_ID,
+                "state": state,
+                "redirect_uri": REDIRECT_URI,
+                "scope": SCOPE,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "nonce": nonce,
+                "ui_locales": "nl",
+                "transactionId": transaction_id,
+                "redirectedToAuthForm": "",
+            }
+        )
+        return f"{OPENID_BASE}/oidc/authorize?{query}"
+
+    def _login(self, return_uri: str) -> str:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Origin": "https://auth.heytelecom.be",
+            "Referer": "https://auth.heytelecom.be/",
+            "x-api-key": API_KEY_LOGIN,
+            "x-channel-id": "web",
+            "x-usecase-id": "login-email-pwd",
+            "x-usersession-id": "".join(
+                secrets.choice("0123456789") for _ in range(30)
+            ),
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+        }
+        resp = self.session.post(
+            f"{API_BASE}/api/bff/auth/v1/login/email",
+            data={
+                "email": self.email,
+                "password": self.password,
+                "returnUri": return_uri,
+            },
+            headers=headers,
+            allow_redirects=False,
+        )
+        location = resp.headers.get("Location")
+        if not location:
+            raise RuntimeError(
+                f"Login failed (status {resp.status_code}). "
+                "Check credentials / Incapsula challenge."
+            )
+        return location
+
+    def _collect_code(self, authorize_url: str) -> str:
+        resp = self.session.get(authorize_url, allow_redirects=False)
+        location = resp.headers.get("Location", "")
+        code = parse_qs(urlparse(location).query).get("code", [""])[0]
+        if not code:
+            raise RuntimeError(
+                f"No authorization code returned (status {resp.status_code}, "
+                f"location={location!r})"
+            )
+        return code
+
+    def _exchange_token(self, code: str, code_verifier: str) -> str:
+        resp = self.session.post(
+            f"{OPENID_BASE}/oidc/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "code_verifier": code_verifier,
+                "client_id": CLIENT_ID,
+            },
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://ecare.heytelecom.be",
+                "Referer": "https://ecare.heytelecom.be/",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+
+    # ====================================================================== #
+    # Authenticated BFF data calls
+    # ====================================================================== #
+
+    TOKEN_LIFETIME = 3300  # ~55 min, slightly under the 1-hour OAuth2 lifetime
+
+    def _ensure_token(self) -> None:
+        """Re-login if the access token has expired."""
+        if not self.access_token:
+            return
+        age = time.time() - self._token_obtained_at
+        if age > self.TOKEN_LIFETIME:
+            log.warning("Access token expired (%.0fs old), re-authenticating", age)
+            self.login()
+
+    def _bff_headers(self, extra: Optional[dict] = None) -> dict:
+        self._ensure_token()
+        if not self.access_token:
+            raise RuntimeError("Not authenticated - call login() first.")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Language": "nl",
+            "Origin": "https://ecare.heytelecom.be",
+            "Referer": "https://ecare.heytelecom.be/",
+            "x-api-key": API_KEY_DATA,
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+        }
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _get(self, path: str, params=None, extra_headers=None):
+        resp = self.session.get(
+            f"{API_BASE}{path}",
+            params=params,
+            headers=self._bff_headers(extra_headers),
+        )
+        resp.raise_for_status()
         try:
-            self._page.wait_for_selector('span.p-menuitem-text.ng-star-inserted.button-label:has-text("Mijn account")', timeout=10000)
-        except:
-            pass
-        
-        self._wait_for_page_load()
-        
-        # Verify login
-        if not self._check_logged_in():
-            raise RuntimeError("Login verification failed")
+            return resp.json()
+        except requests.exceptions.JSONDecodeError:
+            raise RuntimeError(
+                f"Expected JSON from {path} but got content-type "
+                f"{resp.headers.get('content-type', '?')!r} — possible "
+                "Incapsula/Imperva challenge page."
+            )
+
+    # ====================================================================== #
+    # Public API — same interface as the old Playwright client
+    # ====================================================================== #
 
     def get_products(self) -> List[Product]:
-        """
-        Get all products from the account.
-        
+        """Get all products from the account.
+
         Returns:
-            List of Product objects
+            List of Product objects (mobile lines, internet, ...).
         """
-        if not self._page:
-            raise RuntimeError("Browser not connected. Call connect() first.")
-        
-        # Navigate to products page
-        self._page.goto(f"{self.BASE_URL}/nl/mijn-producten")
-        self._wait_for_page_load()
-        
-        # Handle cookie popup
-        self._handle_cookie_popup()
-        time.sleep(1)
-        
-        self._page.wait_for_selector('li.iris-products__item', timeout=10000)
-        
-        products = self._page.locator('li.iris-products__item')
-        product_count = products.count()
-        
-        if product_count == 0:
-            return []
-        
-        # Collect product data
-        products_data = []
-        for i in range(product_count):
-            product = products.nth(i)
-            product_data = self._extract_product_basic_info(product)
-            identifier = self._get_product_identifier(product)
-            products_data.append({
-                "identifier": identifier,
-                "data": product_data
-            })
-        
-        # Extract usage data for each product
-        for product_info in products_data:
-            identifier = product_info["identifier"]
-            product_data = product_info["data"]
-            
-            # Find product again (in case page reloaded)
-            product = self._find_product_by_identifier(identifier)
-            if not product:
-                continue
-            
-            # Extract usage
-            consumption_link = product.locator('a.iris-products__link[data-event_category="MyProducts"]')
-            if consumption_link.count() > 0:
-                consumption_link.click()
-                usage_data = self._extract_usage_data()
-                if usage_data:
-                    product_data["usage"] = usage_data
-                
-                # Go back using browser back (faster than full page reload)
-                self._page.go_back()
-                self._wait_for_page_load()
-                self._page.wait_for_selector('li.iris-products__item', timeout=10000)
-        
-        # Convert to Product objects
-        return [self._create_product_object(p["data"]) for p in products_data]
+        inventory = self._get("/api/bff/product-inventory/v1/productInventory")
+        products: List[Product] = []
+
+        for item in inventory:
+            msisdn_raw = item.get("MSISDN", "")
+            tariff = item.get("tariffName", "")
+            product_type_raw = item.get("productType", "")
+            price_info = item.get("price", {})
+            price_value = price_info.get("value")
+
+            # Map API productType to old library conventions
+            if product_type_raw == "M":
+                product_type = "mobile"
+                phone_number = _format_msisdn(msisdn_raw)
+                product_id = f"mobile_{msisdn_raw}"
+                easy_switch_number = None
+            elif product_type_raw == "F":
+                product_type = "internet"
+                phone_number = None
+                easy_switch_number = msisdn_raw
+                product_id = f"internet_{msisdn_raw}"
+            else:
+                product_type = product_type_raw or "unknown"
+                phone_number = _format_msisdn(msisdn_raw) if msisdn_raw else None
+                easy_switch_number = msisdn_raw if not phone_number else None
+                product_id = f"{product_type}_{msisdn_raw}"
+
+            # Build contract
+            contract = None
+            if price_value is not None:
+                contract = Contract(price_per_month_eur=float(price_value))
+
+            # Fetch usage for mobile lines
+            usage = None
+            if product_type_raw == "M":
+                msisdn_intl = _normalize_msisdn(msisdn_raw)
+                usage = self._fetch_usage(msisdn_intl)
+
+            products.append(
+                Product(
+                    product_id=product_id,
+                    product_type=product_type,
+                    phone_number=phone_number,
+                    easy_switch_number=easy_switch_number,
+                    tariff=tariff,
+                    contract=contract,
+                    usage=usage,
+                )
+            )
+
+        return products
 
     def get_latest_invoice(self) -> Optional[Invoice]:
-        """
-        Get the latest invoice.
-        
+        """Get the latest invoice.
+
         Returns:
-            Invoice object or None if no invoice found
+            Invoice object or None if no invoice data is available.
         """
-        if not self._page:
-            raise RuntimeError("Browser not connected. Call connect() first.")
-        
-        self._page.goto(f"{self.BASE_URL}/nl/mijn-facturen")
-        self._wait_for_page_load()
-        
-        # Handle cookie popup (reduced wait time)
-        self._handle_cookie_popup()
-        time.sleep(0.5)
-        
         try:
-            self._page.wait_for_selector('lib-obe-latest-invoice section.iris-invoice', timeout=10000)
-        except:
+            data = self._get("/api/bff/invoice/v1/latest")
+        except (requests.RequestException, RuntimeError) as exc:
+            log.warning("Failed to fetch latest invoice: %s", exc)
             return None
-        
-        invoice_section = self._page.locator('lib-obe-latest-invoice section.iris-invoice')
-        if invoice_section.count() == 0:
+
+        if not data:
             return None
-        
-        invoice_data = {}
-        
-        # Extract amount
-        amount_element = invoice_section.locator('p.iris-invoice__main-data-title:has-text("Bedrag")').locator('xpath=following-sibling::p').first
-        if amount_element.count() > 0:
-            amount_text = amount_element.inner_text().strip()
-            invoice_data["amount_eur"] = parse_price(amount_text)
-        
-        # Extract status
-        status_element = invoice_section.locator('p.iris-invoice__main-data-title:has-text("Status")').locator('xpath=following-sibling::p').first
-        if status_element.count() > 0:
-            status_text = status_element.inner_text().strip()
-            invoice_data["status"] = status_text
-            invoice_data["paid"] = status_text.lower() == "betaald"
-        
-        # Extract date
-        date_element = invoice_section.locator('p.iris-invoice__main-data-title:has-text("Datum")').locator('xpath=following-sibling::p').first
-        if date_element.count() > 0:
-            date_text = date_element.inner_text().strip()
-            invoice_data["date"] = parse_date(date_text)
-        
-        # Extract due date
-        due_date_element = invoice_section.locator('p.iris-invoice__main-data-title:has-text("Vervaldatum")').locator('xpath=following-sibling::p').first
-        if due_date_element.count() > 0:
-            due_date_text = due_date_element.inner_text().strip()
-            invoice_data["due_date"] = parse_date(due_date_text)
-        
-        # Generate invoice ID
-        if invoice_data.get("date"):
-            invoice_data["invoice_id"] = f"INV-{invoice_data['date'].replace('-', '')}"
-        
-        return Invoice(**invoice_data)
+
+        amount = data.get("amount", {}).get("value")
+        if amount is None:
+            amount = data.get("amountEur") or data.get("totalAmount")
+        if amount is not None:
+            amount = float(amount)
+
+        status = data.get("status", "")
+        paid = status.lower() in ("betaald", "paid") if isinstance(status, str) else False
+
+        date = data.get("date") or data.get("invoiceDate")
+        due_date = data.get("dueDate") or data.get("paymentDueDate")
+
+        invoice_id = data.get("invoiceId") or data.get("id")
+        if not invoice_id and date:
+            invoice_id = f"INV-{date.replace('-', '')}"
+
+        return Invoice(
+            invoice_id=invoice_id,
+            amount_eur=amount,
+            status=status,
+            paid=paid,
+            date=date,
+            due_date=due_date,
+        )
 
     def get_account_data(self) -> AccountData:
-        """
-        Get all account data including products and latest invoice.
-        
+        """Get all account data including products and latest invoice.
+
         Returns:
-            AccountData object with all information
+            AccountData object with all information.
         """
         products = self.get_products()
         invoice = self.get_latest_invoice()
-        
+
         return AccountData(
             products=products,
-            latest_invoice=invoice
+            latest_invoice=invoice,
         )
 
-    def _extract_product_basic_info(self, product) -> Dict[str, Any]:
-        """Extract basic product information."""
-        product_data = {}
-        
-        # Phone number
-        phone_number = product.locator('span.iris-products__details-tariff-number')
-        if phone_number.count() > 0:
-            product_data["phone_number"] = phone_number.inner_text()
-        
-        # Tariff name
-        tariff_name = product.locator('span.iris-products__details-tariff-name')
-        if tariff_name.count() > 0:
-            product_data["tariff"] = tariff_name.inner_text()
-        
-        # Easy Switch number
-        easy_switch = product.locator('span.iris-products__details-info-title:has-text("Nummer Easy Switch")').locator('xpath=following-sibling::span')
-        if easy_switch.count() > 0:
-            product_data["easy_switch_number"] = easy_switch.inner_text()
-        
-        # Contract start date
-        start_date_label = product.locator('span.iris-products__details-info-title:has-text("Begindatum contract")')
-        if start_date_label.count() > 0:
-            start_date_value = start_date_label.locator('xpath=following-sibling::span').first
-            start_date_text = start_date_value.inner_text().strip()
-            if start_date_text:
-                product_data["contract_start_date"] = parse_date(start_date_text)
-        
-        # Price
-        price_label = product.locator('span.iris-products__details-info-title:has-text("Prijs")')
-        if price_label.count() > 0:
-            price_value = price_label.locator('xpath=following-sibling::span').first
-            price_text = price_value.inner_text()
-            product_data["price_per_month_eur"] = parse_price(price_text)
-        
-        return product_data
+    # ====================================================================== #
+    # Usage (private)
+    # ====================================================================== #
 
-    def _extract_usage_data(self) -> Optional[Dict[str, Any]]:
-        """Extract usage data from detailed usage page."""
+    def _fetch_usage(self, msisdn: str) -> Optional[UsageData]:
+        """Fetch consumption/balance for a mobile line."""
         try:
-            self._page.wait_for_url("**/gedetailleerd-gebruik**", timeout=10000)
-        except:
-            pass
-        
-        # Only wait for page load (selector check is redundant)
-        self._wait_for_page_load()
-        
-        if "gedetailleerd-gebruik" not in self._page.url:
-            return None
-        
-        usage_data = {}
-        
-        # Extract date range
-        date_range = self._page.locator('p.iris-consumption__main-date-range')
-        if date_range.count() > 0:
-            period_text = date_range.inner_text()
-            usage_data["period"] = parse_period(period_text)
-        
-        # Extract Data usage (mobile)
-        data_block = self._page.locator('div#consumption-data')
-        if data_block.count() > 0:
-            usage_data["data"] = self._extract_data_usage(data_block)
-        
-        # Extract Data usage (internet)
-        fix_block = self._page.locator('div#consumption-fix')
-        if fix_block.count() > 0:
-            usage_data["data"] = self._extract_data_usage(fix_block)
-        
-        # Extract Calls usage
-        calls_block = self._page.locator('div#consumption-calls')
-        if calls_block.count() > 0:
-            calls_limit = calls_block.locator('span.iris-consumption__main-data-limit')
-            calls_usage = calls_block.locator('span.iris-consumption__main-data-usage strong')
-            calls_update = calls_block.locator('span.iris-consumption__main-data-update')
-            
-            if calls_limit.count() > 0 and calls_usage.count() > 0:
-                limit_text = calls_limit.inner_text()
-                used_text = calls_usage.inner_text()
-                usage_data["calls"] = {
-                    "used": parse_minutes(used_text),
-                    "unlimited": is_unlimited(limit_text),
-                    "last_update": parse_last_update(calls_update.inner_text() if calls_update.count() > 0 else None)
-                }
-        
-        # Extract SMS/MMS usage
-        sms_block = self._page.locator('div#consumption-sms')
-        if sms_block.count() > 0:
-            sms_limit = sms_block.locator('span.iris-consumption__main-data-limit')
-            sms_usage = sms_block.locator('span.iris-consumption__main-data-usage strong')
-            sms_update = sms_block.locator('span.iris-consumption__main-data-update')
-            
-            if sms_limit.count() > 0 and sms_usage.count() > 0:
-                limit_text = sms_limit.inner_text()
-                used_text = sms_usage.inner_text()
-                usage_data["sms_mms"] = {
-                    "used": parse_sms_count(used_text),
-                    "unlimited": is_unlimited(limit_text),
-                    "last_update": parse_last_update(sms_update.inner_text() if sms_update.count() > 0 else None)
-                }
-        
-        return usage_data
-
-    def _extract_data_usage(self, block) -> Dict[str, Any]:
-        """Extract data usage from a block."""
-        data_limit = block.locator('span.iris-consumption__main-data-limit')
-        data_usage = block.locator('span.iris-consumption__main-data-usage strong')
-        data_update = block.locator('span.iris-consumption__main-data-update')
-        
-        if data_limit.count() > 0 and data_usage.count() > 0:
-            limit_text = data_limit.inner_text()
-            used_text = data_usage.inner_text()
-            return {
-                "used": parse_data_amount(used_text),
-                "limit": parse_data_amount(limit_text),
-                "unlimited": is_unlimited(limit_text),
-                "last_update": parse_last_update(data_update.inner_text() if data_update.count() > 0 else None)
-            }
-        return {}
-
-    def _get_product_identifier(self, product):
-        """Get unique identifier for a product."""
-        # Try phone number
-        phone_number = product.locator('span.iris-products__details-tariff-number')
-        if phone_number.count() > 0:
-            return ("phone", phone_number.inner_text())
-        
-        # Try Easy Switch number
-        easy_switch = product.locator('span.iris-products__details-info-title:has-text("Nummer Easy Switch")').locator('xpath=following-sibling::span')
-        if easy_switch.count() > 0:
-            return ("easy_switch", easy_switch.inner_text())
-        
-        # Fallback to tariff name
-        tariff_name = product.locator('span.iris-products__details-tariff-name')
-        if tariff_name.count() > 0:
-            return ("tariff", tariff_name.inner_text())
-        
-        return None
-
-    def _find_product_by_identifier(self, identifier):
-        """Find product by identifier."""
-        if not identifier:
-            return None
-        
-        products = self._page.locator('li.iris-products__item')
-        for i in range(products.count()):
-            product = products.nth(i)
-            current_id = self._get_product_identifier(product)
-            if current_id and current_id == identifier:
-                return product
-        
-        return None
-
-    def _create_product_object(self, data: Dict[str, Any]) -> Product:
-        """Create Product object from data dictionary."""
-        # Determine product type and ID
-        if "phone_number" in data:
-            product_type = "mobile"
-            phone_clean = data["phone_number"].replace(" ", "")
-            product_id = f"mobile_{phone_clean}"
-        elif "easy_switch_number" in data:
-            product_type = "internet"
-            product_id = f"internet_{data['easy_switch_number']}"
-        else:
-            product_type = "unknown"
-            product_id = f"unknown_{data.get('tariff', 'product')}"
-        
-        # Create contract if exists
-        contract = None
-        if "contract_start_date" in data or "price_per_month_eur" in data:
-            contract = Contract(
-                start_date=data.get("contract_start_date"),
-                price_per_month_eur=data.get("price_per_month_eur")
+            data = self._get(
+                "/api/bff/info-consumption/v1/usage",
+                params={"timestamp": int(time.time() * 1000)},
+                extra_headers={"x-req-msisdn": msisdn},
             )
-        
-        # Create usage if exists
-        usage = None
-        if "usage" in data:
-            usage = UsageData(**data["usage"])
-        
-        return Product(
-            product_id=product_id,
-            product_type=product_type,
-            phone_number=data.get("phone_number"),
-            easy_switch_number=data.get("easy_switch_number"),
-            tariff=data.get("tariff"),
-            contract=contract,
-            usage=usage
-        )
+        except (requests.RequestException, RuntimeError) as exc:
+            log.warning("Failed to fetch usage for %s: %s", msisdn, exc)
+            return None
+
+        balances = data.get("BalancePresentation", [])
+        if not balances:
+            return None
+
+        period = None
+        date_range = data.get("dateRange") or data.get("period")
+        if date_range:
+            period = {
+                "start": date_range.get("start"),
+                "end": date_range.get("end"),
+            }
+
+        calls_used = 0.0
+        calls_unlimited = False
+        sms_used = 0
+        sms_unlimited = False
+        data_used_gb: Optional[float] = None
+        data_limit_gb: Optional[float] = None
+        data_unlimited = False
+
+        for bal in balances:
+            name = (bal.get("Name") or "").lower()
+            consumed = bal.get("ConsumedAmount", {})
+            consumed_val = consumed.get("Amount")
+            unit = (bal.get("Unit") or "").lower()
+            category = (bal.get("Category") or "").lower()
+
+            if consumed_val is not None:
+                consumed_val = float(consumed_val)
+
+            if "data" in name or "internet" in category:
+                data_used_gb = consumed_val
+                data_unlimited = "onbeperkt" in name or "unlimited" in name
+                limit = bal.get("LimitAmount")
+                if limit is not None:
+                    data_limit_gb = float(limit)
+            elif "minuut" in name or "call" in category or "bel" in name:
+                calls_used = consumed_val or 0.0
+                calls_unlimited = "onbeperkt" in name or "unlimited" in name
+            elif "sms" in name or "mms" in name or "sms" in category:
+                sms_used = int(consumed_val or 0)
+                sms_unlimited = "onbeperkt" in name or "unlimited" in name
+
+        usage_dict: Dict = {}
+        if data_used_gb is not None or data_limit_gb is not None:
+            usage_dict["data"] = {
+                "used": data_used_gb,
+                "limit": data_limit_gb,
+                "unlimited": data_unlimited,
+            }
+        if calls_used or calls_unlimited:
+            usage_dict["calls"] = {
+                "used": calls_used,
+                "unlimited": calls_unlimited,
+            }
+        if sms_used or sms_unlimited:
+            usage_dict["sms_mms"] = {
+                "used": sms_used,
+                "unlimited": sms_unlimited,
+            }
+
+        if not usage_dict:
+            return None
+
+        return UsageData(period=period, **usage_dict)
