@@ -1,8 +1,11 @@
 """
+[HISTORICAL — frozen snapshot]
+
 HeyTelecom e-care API client (reverse-engineered from a browser HAR capture).
 
-This script replicates, with the `requests` library, exactly what the
-ecare.heytelecom.be single-page app does so the carrier sees "normal" traffic:
+This script was used during development to reverse-engineer the OAuth2/PKCE
+flow.  The production implementation lives in ``src/heytelecom/client.py``.
+Do not modify this file — it is kept as a reference only.
 
     1. OAuth2 Authorization-Code + PKCE (S256) against openid.heytelecom.be
     2. Email/password login via the BFF auth endpoint (sets the `wassup` cookie)

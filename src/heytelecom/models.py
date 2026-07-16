@@ -1,4 +1,6 @@
 """Data models for Hey Telecom."""
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -95,7 +97,7 @@ class Invoice:
             result["amount_eur"] = self.amount_eur
         if self.status:
             result["status"] = self.status.lower()
-        if self.paid is not None:
+        if self.paid:
             result["paid"] = self.paid
         if self.date:
             result["date"] = self.date

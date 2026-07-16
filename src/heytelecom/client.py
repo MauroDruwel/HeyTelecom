@@ -130,6 +130,7 @@ class HeyTelecomClient:
         if not self.email or not self.password:
             raise ValueError("Email and password required for login")
 
+        self.session.cookies.clear()
         code_verifier, code_challenge = _generate_pkce()
         state = nonce = _b64url(secrets.token_bytes(33))
 
@@ -375,7 +376,7 @@ class HeyTelecomClient:
         """
         try:
             data = self._get("/api/bff/invoice/v1/latest")
-        except Exception as exc:
+        except (requests.RequestException, RuntimeError) as exc:
             log.warning("Failed to fetch latest invoice: %s", exc)
             return None
 
@@ -433,7 +434,7 @@ class HeyTelecomClient:
                 params={"timestamp": int(time.time() * 1000)},
                 extra_headers={"x-req-msisdn": msisdn},
             )
-        except Exception as exc:
+        except (requests.RequestException, RuntimeError) as exc:
             log.warning("Failed to fetch usage for %s: %s", msisdn, exc)
             return None
 
@@ -449,7 +450,6 @@ class HeyTelecomClient:
                 "end": date_range.get("end"),
             }
 
-        usage_data: Dict = {}
         calls_used = 0.0
         calls_unlimited = False
         sms_used = 0

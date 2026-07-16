@@ -11,6 +11,7 @@ This example demonstrates how to use the HeyTelecomClient to:
 
 import json
 import os
+import traceback
 from heytelecom import HeyTelecomClient
 
 EMAIL = os.environ.get("HEY_EMAIL", "")
@@ -85,7 +86,6 @@ def main():
 
         except Exception as e:
             print(f"Error fetching data: {e}")
-            import traceback
             traceback.print_exc()
 
     print("\nExample completed!")
