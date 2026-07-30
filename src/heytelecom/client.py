@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -25,24 +27,27 @@ from .constants import (
     REQUEST_TIMEOUT,
     TOKEN_LIFETIME,
 )
+from .exceptions import APIError, AuthenticationError, HeyTelecomError
 from .models import AccountData, Contract, Invoice, Product, UsageData
 from .usage import parse_usage_response
 from .utils import TTLCache, format_msisdn, normalize_msisdn
+
+__all__ = ["HeyTelecomClient"]
 
 logger = logging.getLogger(__name__)
 
 
 def _extract_amount(data: dict) -> float | None:
-    patterns = [
-        lambda d: d.get("amount", {}).get("value"),
-        lambda d: d.get("amountEur"),
-        lambda d: d.get("totalAmount"),
-        lambda d: d.get("invoiceAmount", {}).get("value"),
-    ]
-    for pattern in patterns:
-        amount = pattern(data)
-        if amount is not None:
-            return round(float(amount), 2)
+    """Extract a monetary amount from an API response dict, trying multiple keys."""
+    candidates = (
+        data.get("amount", {}).get("value"),
+        data.get("amountEur"),
+        data.get("totalAmount"),
+        data.get("invoiceAmount", {}).get("value"),
+    )
+    for c in candidates:
+        if c is not None:
+            return round(float(c), 2)
     return None
 
 
@@ -51,18 +56,19 @@ class HeyTelecomClient:
         self,
         email: str | None = None,
         password: str | None = None,
-        max_workers: int = 4,
     ):
         self.email = email
         self.password = password
         self.session = self._make_session()
         self.access_token: str | None = None
         self._token_obtained_at: float = 0.0
+        self._token_lock = threading.Lock()
         self._cache = TTLCache()
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        weakref.finalize(self, self.session.close)
 
     @staticmethod
     def _make_session() -> requests.Session:
+        """Create a requests session with retry support and default headers."""
         session = requests.Session()
         retry = Retry(
             total=2,
@@ -74,40 +80,63 @@ class HeyTelecomClient:
         session.headers.update(DEFAULT_HEADERS)
         return session
 
-    def __enter__(self):
+    def __enter__(self) -> HeyTelecomClient:
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False)
+        """Close the underlying HTTP session."""
         self.session.close()
 
-    def login(self) -> None:
+    def clear_credentials(self) -> None:
+        """Remove stored email and password from memory.
+
+        After calling this method, automatic re-authentication on token
+        expiry will no longer be possible — call :meth:`login` again first.
+        """
+        self.email = None
+        self.password = None
+
+    def login(self) -> str:
+        """Authenticate and obtain an access token.
+
+        Raises ``ValueError`` when email or password were not provided.
+        """
         if not self.email or not self.password:
             raise ValueError("Email and password required for login")
 
-        self._cache.invalidate()
         token, obtained_at = auth.login(self.session, self.email, self.password)
-        self.access_token = token
-        self._token_obtained_at = obtained_at
+        with self._token_lock:
+            self.access_token = token
+            self._token_obtained_at = obtained_at
+            self._cache.invalidate()
+        return token
 
-    def _ensure_token(self) -> None:
-        if not self.access_token:
-            raise RuntimeError(
-                "Not authenticated — call login() or pass email/password to the constructor first."
-            )
-        age = time.time() - self._token_obtained_at
-        if age > TOKEN_LIFETIME:
-            logger.warning("Access token expired (%.0fs old), re-authenticating", age)
-            self.login()
+    def _get_token(self) -> str:
+        """Return a valid access token, re-authenticating if expired.
+
+        Uses double-checked locking to prevent concurrent re-login.
+        """
+        with self._token_lock:
+            if not self.access_token:
+                raise AuthenticationError(
+                    "Not authenticated — call login() or pass email/password first."
+                )
+            if time.time() - self._token_obtained_at <= TOKEN_LIFETIME:
+                return self.access_token
+            logger.warning("Access token expired, re-authenticating")
+            token, obtained_at = auth.login(self.session, self.email, self.password)
+            self.access_token = token
+            self._token_obtained_at = obtained_at
+            self._cache.invalidate()
+            return self.access_token
 
     def _bff_headers(self, extra: dict | None = None) -> dict[str, str]:
-        self._ensure_token()
         headers: dict[str, str] = {
             **BFF_BASE_HEADERS,
-            "Authorization": f"Bearer {self.access_token}",
+            "Authorization": f"Bearer {self._get_token()}",
         }
         if extra:
             headers.update(extra)
@@ -124,82 +153,90 @@ class HeyTelecomClient:
         try:
             return resp.json()
         except requests.exceptions.JSONDecodeError:
-            raise RuntimeError(
+            raise APIError(
                 f"Expected JSON from {path} but got content-type "
                 f"{resp.headers.get('content-type', '?')!r} — possible "
                 "Incapsula/Imperva challenge page."
             )
 
+    def _classify_product(
+        self, product_type_raw: str, msisdn_raw: str
+    ) -> tuple[str, str | None, str | None, str]:
+        """Map raw product type to a friendly type and derived identifiers."""
+        if product_type_raw == PRODUCT_TYPE_MOBILE:
+            return (
+                "mobile",
+                format_msisdn(msisdn_raw),
+                None,
+                f"mobile_{normalize_msisdn(msisdn_raw)}",
+            )
+        if product_type_raw == PRODUCT_TYPE_FIXED:
+            return "internet", None, msisdn_raw, f"internet_{msisdn_raw}"
+        product_type = product_type_raw or "unknown"
+        phone = format_msisdn(msisdn_raw) if msisdn_raw else None
+        easy_switch = msisdn_raw if not phone else None
+        return product_type, phone, easy_switch, f"{product_type}_{msisdn_raw}"
+
+    def _build_product(self, item: dict, usage_results: dict[str, UsageData | None]) -> Product:
+        msisdn_raw = item.get("MSISDN", "")
+        tariff = item.get("tariffName", "")
+        product_type_raw = item.get("productType", "")
+        price_value = item.get("price", {}).get("value")
+
+        product_type, phone_number, easy_switch_number, product_id = self._classify_product(
+            product_type_raw, msisdn_raw
+        )
+
+        contract = None
+        if price_value is not None:
+            contract = Contract(price_per_month_eur=round(float(price_value), 2))
+
+        usage = None
+        if product_type_raw == PRODUCT_TYPE_MOBILE:
+            usage = usage_results.get(normalize_msisdn(msisdn_raw))
+
+        return Product(
+            product_id=product_id,
+            product_type=product_type,
+            phone_number=phone_number,
+            easy_switch_number=easy_switch_number,
+            tariff=tariff,
+            contract=contract,
+            usage=usage,
+        )
+
     def get_products(self, use_cache: bool = True) -> list[Product]:
+        """Fetch all products and their usage data.
+
+        Usage for each mobile line is fetched in parallel via a thread pool.
+        """
         if use_cache:
             cached = self._cache.get("products")
             if cached is not None:
                 return cached
 
-        inventory = self._get(PATH_PRODUCT_INVENTORY)
-        products: list[Product] = []
+        try:
+            inventory = self._get(PATH_PRODUCT_INVENTORY)
+        except (requests.RequestException, HeyTelecomError) as exc:
+            logger.warning("Failed to fetch products: %s", exc)
+            return []
 
         mobile_msisdns = [
-            normalize_msisdn(item.get("MSISDN", ""))
+            normalize_msisdn(item["MSISDN"])
             for item in inventory
-            if item.get("productType") == PRODUCT_TYPE_MOBILE
+            if item.get("productType") == PRODUCT_TYPE_MOBILE and item.get("MSISDN")
         ]
 
         usage_results: dict[str, UsageData | None] = {}
-        if mobile_msisdns:
-            fut_map = {
-                self._executor.submit(self._fetch_usage, msisdn): msisdn
-                for msisdn in mobile_msisdns
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            future_map = {
+                pool.submit(self._fetch_usage, msisdn): msisdn for msisdn in mobile_msisdns
             }
-            for fut in as_completed(fut_map):
-                msisdn = fut_map[fut]
-                try:
-                    usage_results[msisdn] = fut.result()
-                except Exception as exc:
-                    logger.warning("Failed to fetch usage for %s: %s", msisdn, exc)
-                    usage_results[msisdn] = None
+            for future in as_completed(future_map):
+                msisdn = future_map[future]
+                usage_results[msisdn] = future.result()
 
-        for item in inventory:
-            msisdn_raw = item.get("MSISDN", "")
-            tariff = item.get("tariffName", "")
-            product_type_raw = item.get("productType", "")
-            price_value = item.get("price", {}).get("value")
-
-            if product_type_raw == PRODUCT_TYPE_MOBILE:
-                product_type = "mobile"
-                phone_number = format_msisdn(msisdn_raw)
-                product_id = f"mobile_{msisdn_raw}"
-                easy_switch_number = None
-            elif product_type_raw == PRODUCT_TYPE_FIXED:
-                product_type = "internet"
-                phone_number = None
-                easy_switch_number = msisdn_raw
-                product_id = f"internet_{msisdn_raw}"
-            else:
-                product_type = product_type_raw or "unknown"
-                phone_number = format_msisdn(msisdn_raw) if msisdn_raw else None
-                easy_switch_number = msisdn_raw if not phone_number else None
-                product_id = f"{product_type}_{msisdn_raw}"
-
-            contract = None
-            if price_value is not None:
-                contract = Contract(price_per_month_eur=round(float(price_value), 2))
-
-            usage = None
-            if product_type_raw == PRODUCT_TYPE_MOBILE:
-                usage = usage_results.get(normalize_msisdn(msisdn_raw))
-
-            products.append(
-                Product(
-                    product_id=product_id,
-                    product_type=product_type,
-                    phone_number=phone_number,
-                    easy_switch_number=easy_switch_number,
-                    tariff=tariff,
-                    contract=contract,
-                    usage=usage,
-                )
-            )
+        products = [self._build_product(item, usage_results) for item in inventory]
 
         self._cache.set("products", products)
         return products
@@ -212,7 +249,7 @@ class HeyTelecomClient:
 
         try:
             data = self._get(PATH_LATEST_INVOICE)
-        except (requests.RequestException, RuntimeError) as exc:
+        except (requests.RequestException, HeyTelecomError) as exc:
             logger.warning("Failed to fetch latest invoice: %s", exc)
             return None
 
@@ -267,14 +304,14 @@ class HeyTelecomClient:
     def get_benefits(self) -> dict | None:
         try:
             return self._get(PATH_BENEFITS)
-        except (requests.RequestException, RuntimeError) as exc:
+        except (requests.RequestException, HeyTelecomError) as exc:
             logger.warning("Failed to fetch benefits: %s", exc)
             return None
 
     def get_profile_products(self) -> dict | None:
         try:
             return self._get(PATH_PROFILE_PRODUCTS)
-        except (requests.RequestException, RuntimeError) as exc:
+        except (requests.RequestException, HeyTelecomError) as exc:
             logger.warning("Failed to fetch profile products: %s", exc)
             return None
 
@@ -293,8 +330,12 @@ class HeyTelecomClient:
                 params={"timestamp": int(time.time() * 1000)},
                 extra_headers={"x-req-msisdn": msisdn},
             )
-        except (requests.RequestException, RuntimeError) as exc:
+        except (requests.RequestException, HeyTelecomError) as exc:
             logger.warning("Failed to fetch usage for %s: %s", msisdn, exc)
             return None
 
-        return parse_usage_response(data)
+        try:
+            return parse_usage_response(data)
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.warning("Failed to parse usage for %s: %s", msisdn, exc)
+            return None
