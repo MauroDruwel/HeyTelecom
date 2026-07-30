@@ -8,6 +8,14 @@ flow.  The production implementation lives in ``src/heytelecom/client.py``.
 Do not modify this file — it is kept as a reference only.
 
     1. OAuth2 Authorization-Code + PKCE (S256) against openid.heytelecom.be
+
+import sys
+raise RuntimeError(
+    "research/test.py is a historical reference snapshot. "
+    "Import 'heytelecom' from the package instead."
+)
+sys.__spec__  # unreachable — keeps linter happy
+del sys
     2. Email/password login via the BFF auth endpoint (sets the `wassup` cookie)
     3. Exchange the returned `code` for a Bearer access_token
     4. Call the BFF data endpoints (product inventory, profile, usage, ...)

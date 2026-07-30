@@ -1,16 +1,17 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "heytelecom"
-version = "0.2.0"
+dynamic = ["version"]
 description = "A Python library for interacting with Hey Telecom accounts (no browser required)"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.8"
 authors = [
     {name = "Mauro Druwel"}
 ]
+license = {text = "MIT"}
 keywords = ["hey", "telecom", "hey!", "belgium", "mobile", "internet"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -33,6 +34,7 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-cov",
+    "ruff",
 ]
 
 [project.urls]
@@ -42,4 +44,19 @@ Repository = "https://github.com/maurodruwel/heytelecom"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.dynamic]
+version = {attr = "heytelecom.__version__"}
 
+[tool.ruff]
+target-version = "py38"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "SIM", "RET"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
