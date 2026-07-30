@@ -5,7 +5,7 @@ A Python library for interacting with Hey Telecom accounts using
 requests + OAuth2/PKCE (no browser required).
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from .client import HeyTelecomClient
 from .exceptions import APIError, AuthenticationError, HeyTelecomError

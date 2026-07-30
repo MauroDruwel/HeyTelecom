@@ -7,7 +7,7 @@ name = "heytelecom"
 dynamic = ["version"]
 description = "A Python library for interacting with Hey Telecom accounts (no browser required)"
 readme = {file = "README.md", content-type = "text/markdown"}
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 authors = [
     {name = "Mauro Druwel"}
 ]
@@ -18,7 +18,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -48,12 +47,12 @@ where = ["src"]
 version = {attr = "heytelecom.__version__"}
 
 [tool.ruff]
-target-version = "py38"
+target-version = "py39"
 line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "SIM", "RET", "C4", "PERF", "PYI", "RSE", "FLY", "ARG", "RUF", "T20"]
-ignore = ["T20", "PYI034"]  # T20: allow print(); PYI034: Self requires typing_extensions on py38
+ignore = ["T20"]  # T20: allow print() in examples
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["PERF203"]  # try/except in loop is intentional in test helpers

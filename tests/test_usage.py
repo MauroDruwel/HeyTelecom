@@ -216,3 +216,49 @@ def test_parse_english_names():
     assert result.data["used"] == 0.49  # 500 MB = 0.49 GB (rounded)
     assert result.calls["used"] == 30
     assert result.sms_mms["unlimited"] is True
+
+
+def test_parse_data_already_in_gb():
+    data = {
+        "BalancePresentation": [
+            _make_balance(
+                "Data volume",
+                "GByte",
+                2.5,
+                "Data",
+                forfeit_amount=20,
+                forfeit_unit="GB",
+            ),
+        ],
+    }
+    result = parse_usage_response(data)
+    assert result is not None
+    assert result.data["used"] == 2.5
+    assert result.data["limit"] == 20.0
+
+
+def test_parse_data_limit_amount_fallback():
+    entry = {
+        "Name": "Surfvolume",
+        "Unit": "MByte",
+        "ConsumedAmount": {"Amount": 1024},
+        "Category": "Data",
+        "LimitAmount": 10240,
+    }
+    result = parse_usage_response({"BalancePresentation": [entry]})
+    assert result is not None
+    assert result.data["used"] == 1.0
+    assert result.data["limit"] == 10.0
+
+
+def test_parse_skips_non_dict_balances():
+    data = {
+        "BalancePresentation": [
+            None,
+            "bad",
+            _make_balance("Surfvolume", "MByte", 1024, "Data", forfeit_amount=2048),
+        ],
+    }
+    result = parse_usage_response(data)
+    assert result is not None
+    assert result.data["used"] == 1.0

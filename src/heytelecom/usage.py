@@ -2,7 +2,7 @@
 
 The single public entry point :func:`parse_usage_response` converts the
 API response into a :class:`UsageData` model, normalising data volumes
-from MB to GB and categorising entries as data / calls / SMS-MMS.
+to GB and categorising entries as data / calls / SMS-MMS.
 """
 
 from __future__ import annotations
@@ -10,12 +10,14 @@ from __future__ import annotations
 from typing import Any
 
 from .models import UsageData
-from .utils import _mbytes_to_gbytes
+from .utils import _to_gbytes
 
 __all__ = ["parse_usage_response"]
 
 
-_DATA_UNITS = frozenset({"mbyte", "mb", "megabyte", "gbyte", "gb", "gigabyte"})
+_DATA_UNITS_MB = frozenset({"mbyte", "mb", "megabyte"})
+_DATA_UNITS_GB = frozenset({"gbyte", "gb", "gigabyte"})
+_DATA_UNITS = _DATA_UNITS_MB | _DATA_UNITS_GB
 _COST_UNITS = frozenset({"euro", "eur", "€"})
 _CALL_KEYWORDS = frozenset({"minuut", "bellen", "bel", "call", "calls"})
 
@@ -36,6 +38,17 @@ def _is_call_entry(name: str, category: str) -> bool:
     return any(kw in name for kw in _CALL_KEYWORDS) or "voice" in category
 
 
+def _to_gb(amount: float | None, unit: str) -> float | None:
+    """Convert a data amount to GB based on the declared unit."""
+    if amount is None:
+        return None
+    unit_l = (unit or "").lower()
+    if unit_l in _DATA_UNITS_GB:
+        return round(float(amount), 2)
+    # Default / MB units
+    return _to_gbytes(float(amount), from_unit="mb")
+
+
 def _parse_data_balance(bal: dict) -> dict[str, Any] | None:
     consumed = bal.get("ConsumedAmount", {})
     consumed_val = consumed.get("Amount")
@@ -43,20 +56,24 @@ def _parse_data_balance(bal: dict) -> dict[str, Any] | None:
         consumed_val = float(consumed_val)
 
     unlimited = _is_unlimited((bal.get("Name") or "").lower())
-    used_gb = _mbytes_to_gbytes(consumed_val) if consumed_val is not None else None
+    unit = (bal.get("Unit") or consumed.get("Unit") or "").lower()
+    used_gb = _to_gb(consumed_val, unit) if consumed_val is not None else None
 
     limit_gb: float | None = None
     forfeit = bal.get("AmountOfForfeit", {})
     if forfeit:
         limit_val = forfeit.get("Amount")
-        limit_unit = (forfeit.get("Unit") or "").lower()
+        limit_unit = (forfeit.get("Unit") or unit or "").lower()
         if limit_val is not None and _is_data_unit(limit_unit):
-            limit_gb = _mbytes_to_gbytes(float(limit_val))
+            limit_gb = _to_gb(float(limit_val), limit_unit)
 
     if limit_gb is None:
         limit_raw = bal.get("LimitAmount")
         if limit_raw is not None:
-            limit_gb = float(limit_raw)
+            # LimitAmount has no separate unit field in observed responses;
+            # prefer forfeit unit, then balance unit, defaulting to MB.
+            limit_unit = unit if _is_data_unit(unit) else "mbyte"
+            limit_gb = _to_gb(float(limit_raw), limit_unit)
 
     if used_gb is None and limit_gb is None and not unlimited:
         return None
@@ -125,6 +142,8 @@ def parse_usage_response(data: dict) -> UsageData | None:
     usage_dict: dict[str, Any] = {}
 
     for bal in balances:
+        if not isinstance(bal, dict):
+            continue
         name = (bal.get("Name") or "").lower()
         unit = (bal.get("Unit") or "").lower()
         category = (bal.get("Category") or "").lower()
