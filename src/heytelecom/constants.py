@@ -1,5 +1,45 @@
 """Public client-side constants from the Hey Telecom web app."""
 
+from __future__ import annotations
+
+from enum import Enum
+
+__all__ = [
+    "API_BASE",
+    "API_KEY_DATA",
+    "API_KEY_LOGIN",
+    "BFF_BASE_HEADERS",
+    "BFF_ORIGIN",
+    "BFF_REFERER",
+    "CLIENT_ID",
+    "DEFAULT_HEADERS",
+    "OPENID_BASE",
+    "PATH_BENEFITS",
+    "PATH_INVOICES",
+    "PATH_LATEST_INVOICE",
+    "PATH_PRODUCT_INVENTORY",
+    "PATH_PROFILE_PRODUCTS",
+    "PATH_USAGE",
+    "PRODUCT_TYPE_FIXED",
+    "PRODUCT_TYPE_MOBILE",
+    "REDIRECT_URI",
+    "REQUEST_TIMEOUT",
+    "SCOPE",
+    "SEC_CH_UA",
+    "TOKEN_LIFETIME",
+    "USER_AGENT",
+    "ProductType",
+]
+
+
+class ProductType(str, Enum):
+    MOBILE = "M"
+    FIXED = "F"
+
+
+PRODUCT_TYPE_MOBILE = ProductType.MOBILE
+PRODUCT_TYPE_FIXED = ProductType.FIXED
+
 CLIENT_ID = "4x5cSOWeuG"
 REDIRECT_URI = "https://ecare.heytelecom.be/index.html"
 SCOPE = "openid ecare"
@@ -42,13 +82,8 @@ BFF_BASE_HEADERS = {
     "sec-fetch-site": "same-site",
 }
 
-TOKEN_LIFETIME = 3300
+TOKEN_LIFETIME = 3300  # 55 min (actual expiry is 3600s; 300s safety margin for early renewal)
 REQUEST_TIMEOUT = 30
-CACHE_TTL = 60
-
-PRODUCT_TYPE_MOBILE = "M"
-PRODUCT_TYPE_FIXED = "F"
-
 # API endpoint paths
 PATH_PRODUCT_INVENTORY = "/api/bff/product-inventory/v1/productInventory"
 PATH_LATEST_INVOICE = "/api/bff/latest-invoice-overview/v1/invoices/latest"

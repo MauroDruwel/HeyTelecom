@@ -7,26 +7,19 @@ This script was used during development to reverse-engineer the OAuth2/PKCE
 flow.  The production implementation lives in ``src/heytelecom/client.py``.
 Do not modify this file — it is kept as a reference only.
 
-    1. OAuth2 Authorization-Code + PKCE (S256) against openid.heytelecom.be
+    Usage:
+        1. OAuth2 Authorization-Code + PKCE (S256) against openid.heytelecom.be
+        2. Email/password login via the BFF auth endpoint (sets the `wassup` cookie)
+        3. Exchange the returned `code` for a Bearer access_token
+        4. Call the BFF data endpoints (product inventory, profile, usage, ...)
 
-import sys
-raise RuntimeError(
-    "research/test.py is a historical reference snapshot. "
-    "Import 'heytelecom' from the package instead."
-)
-sys.__spec__  # unreachable — keeps linter happy
-del sys
-    2. Email/password login via the BFF auth endpoint (sets the `wassup` cookie)
-    3. Exchange the returned `code` for a Bearer access_token
-    4. Call the BFF data endpoints (product inventory, profile, usage, ...)
+    All requests reuse a single requests.Session so Incapsula/Imperva cookies and
+    the auth session cookie are carried automatically, and the browser headers
+    (User-Agent, sec-ch-ua, origin/referer, x-api-key) are replicated closely.
 
-All requests reuse a single requests.Session so Incapsula/Imperva cookies and
-the auth session cookie are carried automatically, and the browser headers
-(User-Agent, sec-ch-ua, origin/referer, x-api-key) are replicated closely.
-
-Usage:
-    set HEY_EMAIL / HEY_PASSWORD environment variables (or edit the constants),
-    then:  python test.py
+    Usage:
+        set HEY_EMAIL / HEY_PASSWORD environment variables (or edit the constants),
+        then:  python test.py
 """
 
 from __future__ import annotations
@@ -62,7 +55,7 @@ SEC_CH_UA = '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"'
 
 # Credentials - prefer environment variables, never commit real ones.
 EMAIL = os.environ.get("HEY_EMAIL", "your-email@example.com")
-PASSWORD = os.environ.get("HEY_PASSWORD", "your-password")
+PASSWORD = os.environ.get("HEY_PASSWORD")
 
 
 # --------------------------------------------------------------------------- #

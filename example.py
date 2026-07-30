@@ -14,11 +14,11 @@ def main():
     print("Hey Telecom Library Example")
     print("=" * 60)
 
-    with HeyTelecomClient(email=EMAIL, password=PASSWORD) as client:
-        if not EMAIL or not PASSWORD:
-            print("No credentials provided. Set HEY_EMAIL and HEY_PASSWORD environment variables.")
-            return
+    if not EMAIL or not PASSWORD:
+        print("No credentials provided. Set HEY_EMAIL and HEY_PASSWORD environment variables.")
+        return
 
+    with HeyTelecomClient(email=EMAIL, password=PASSWORD) as client:
         print("\nLogging in...")
         try:
             client.login()
