@@ -11,6 +11,7 @@ is :func:`login`, which drives the full four-step flow:
 
 from __future__ import annotations
 
+import contextlib
 import secrets
 import time
 from typing import TYPE_CHECKING
@@ -24,6 +25,7 @@ from .constants import (
     REDIRECT_URI,
     REQUEST_TIMEOUT,
     SCOPE,
+    TOKEN_LIFETIME,
 )
 from .exceptions import AuthenticationError
 from .utils import _b64url, _generate_pkce
@@ -59,23 +61,34 @@ def login(
     email: str,
     password: str,
 ) -> tuple[str, float]:
+    """Run the full OAuth2/PKCE login flow.
+
+    Returns ``(access_token, expires_at)`` where ``expires_at`` is a
+    ``time.time()``-compatible absolute timestamp.
+    """
     _clear_auth_cookies(session)
     code_verifier, code_challenge = _generate_pkce()
-    state = nonce = _b64url(secrets.token_bytes(33))
+    state = _b64url(secrets.token_bytes(33))
+    nonce = _b64url(secrets.token_bytes(33))
 
     transaction_id = _start_authorization(session, state, nonce, code_challenge)
     return_uri = _build_return_uri(state, nonce, code_challenge, transaction_id)
     authorize_url = _login(session, email, password, return_uri)
     code = _collect_code(session, authorize_url)
-    access_token = _exchange_token(session, code, code_verifier)
-    return access_token, time.time()
+    access_token, expires_at = _exchange_token(session, code, code_verifier)
+    return access_token, expires_at
 
 
 def _clear_auth_cookies(session: requests.Session) -> None:
     """Remove cookies for heytelecom domains before a fresh login attempt."""
-    for cookie in list(session.cookies):
-        if any(d in (cookie.domain or "") for d in ("heytelecom", "openid")):
-            session.cookies.clear(domain=cookie.domain)
+    to_clear = [
+        cookie
+        for cookie in list(session.cookies)
+        if any(d in (cookie.domain or "") for d in ("heytelecom", "openid"))
+    ]
+    for cookie in to_clear:
+        with contextlib.suppress(KeyError):
+            session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
 
 
 def _start_authorization(
@@ -162,7 +175,11 @@ def _collect_code(session: requests.Session, authorize_url: str) -> str:
     return code
 
 
-def _exchange_token(session: requests.Session, code: str, code_verifier: str) -> str:
+def _exchange_token(session: requests.Session, code: str, code_verifier: str) -> tuple[str, float]:
+    """Exchange the authorization code for an access token.
+
+    Returns ``(access_token, expires_at)``.
+    """
     resp = session.post(
         f"{OPENID_BASE}/oidc/token",
         data={
@@ -181,9 +198,18 @@ def _exchange_token(session: requests.Session, code: str, code_verifier: str) ->
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
-    token = resp.json().get("access_token")
+    payload = resp.json()
+    token = payload.get("access_token")
     if not token:
         raise AuthenticationError(
             f"Token exchange succeeded but no access_token in response (status {resp.status_code})"
         )
-    return token
+    expires_in = payload.get("expires_in", TOKEN_LIFETIME + 300)
+    try:
+        expires_in = int(expires_in)
+    except (TypeError, ValueError):
+        expires_in = TOKEN_LIFETIME + 300
+    # Renew 5 minutes before actual expiry (matches TOKEN_LIFETIME safety margin).
+    safety_margin = min(300, max(0, expires_in // 12))
+    expires_at = time.time() + max(1, expires_in - safety_margin)
+    return token, expires_at

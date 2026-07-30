@@ -56,9 +56,9 @@ API_KEY_DATA = "KEQRymGhNEonxo79zqM40tphE7zk5NxHOGxjbVsrzsbrkpIs"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/150.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
-SEC_CH_UA = '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"'
+SEC_CH_UA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
 
 DEFAULT_HEADERS = {
     "User-Agent": USER_AGENT,
@@ -82,7 +82,9 @@ BFF_BASE_HEADERS = {
     "sec-fetch-site": "same-site",
 }
 
-TOKEN_LIFETIME = 3300  # 55 min (actual expiry is 3600s; 300s safety margin for early renewal)
+# Fallback token lifetime used only when the token response omits expires_in.
+# Actual expiry is typically 3600s; 300s safety margin for early renewal.
+TOKEN_LIFETIME = 3300
 REQUEST_TIMEOUT = 30
 # API endpoint paths
 PATH_PRODUCT_INVENTORY = "/api/bff/product-inventory/v1/productInventory"

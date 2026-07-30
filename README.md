@@ -9,6 +9,7 @@
 <p align="center">
   <a href="#-quick-install">Quick Install</a> |
   <a href="#%EF%B8%8F-getting-started">Getting Started</a> |
+  <a href="#-api-reference">API Reference</a> |
   <a href="#-features">Features</a> |
   <a href="#-contributing">Contributing</a>
 </p>
@@ -23,11 +24,13 @@
 
 > **Automate your Hey! Telecom account. Get usage, invoices, and more without lifting a finger.**
 
+> ⚠️ Unofficial library. Use against **your own** account only and respect Hey Telecom's terms of service. The portal sits behind Imperva/Incapsula; automated access may occasionally fail.
+
 ---
 
 ## 📦 Quick Install
 
-For the Pythonistas 🐍:
+Requires **Python 3.9+**.
 
 ```bash
 pip install heytelecom
@@ -48,21 +51,79 @@ This whole project was basically an excuse to get my data into Home Assistant.
 
 ## 🛠️ Getting Started
 
-It's super simple. Just tell it who you are, and it does the rest.
+```python
+from heytelecom import HeyTelecomClient, APIError, AuthenticationError
+
+with HeyTelecomClient(email="your@email.com", password="your_password") as client:
+    client.login()
+
+    account_data = client.get_account_data()
+
+    print(f"You have {len(account_data.products)} products.")
+    if account_data.latest_invoice:
+        print(f"Latest invoice: €{account_data.latest_invoice.amount_eur}")
+```
+
+Credentials can also be supplied via environment variables in `example.py`
+(`HEY_EMAIL` / `HEY_PASSWORD`).
+
+---
+
+## 📖 API Reference
+
+### `HeyTelecomClient(email=None, password=None)`
+
+| Method | Returns | Notes |
+|--------|---------|--------|
+| `login()` | `str` (access token) | Required before data calls unless you only construct the client after obtaining a token another way. |
+| `get_account_data(use_cache=True)` | `AccountData` | Products + latest invoice (fetched in parallel). |
+| `get_products(use_cache=True)` | `list[Product]` | Mobile usage fetched in parallel per line. |
+| `get_latest_invoice(use_cache=True)` | `Invoice \| None` | `None` if the account has no invoices. |
+| `get_invoices()` | `list[Invoice]` | Full invoice list (not cached). |
+| `get_benefits()` | raw JSON | Passthrough of the benefits endpoint. |
+| `get_profile_products()` | raw JSON | Passthrough of profile products. |
+| `invalidate_cache()` | `None` | Drop TTL cache entries. |
+| `clear_credentials()` | `None` | Wipe email/password from memory. Auto re-login on token expiry will then fail until `login()` is called again. |
+| `close()` | `None` | Close the HTTP session (also via context manager). |
+
+### Models
+
+- **`AccountData`**: `provider`, `products`, `latest_invoice` — `.to_dict()` skips `None`/empty lists.
+- **`Product`**: `product_id`, `product_type` (`mobile` / `internet` / …), `phone_number`, `easy_switch_number`, `tariff`, `contract`, `usage`.
+- **`UsageData`**: `period`, `data` (`used`/`limit` in **GB**), `calls`, `sms_mms`.
+- **`Invoice`**: `invoice_id`, `amount_eur`, `status`, `paid`, `date`, `due_date`.
+- **`Contract`**: `price_per_month_eur`.
+
+### Exceptions
+
+| Exception | When |
+|-----------|------|
+| `HeyTelecomError` | Base class |
+| `AuthenticationError` | Login failed, missing auth, 401/403, token expired without credentials |
+| `APIError` | Network failure, non-2xx (with `.status_code`), non-JSON / Incapsula HTML, unexpected payload shape |
 
 ```python
-from heytelecom import HeyTelecomClient
+from heytelecom import HeyTelecomClient, APIError, AuthenticationError
 
-# Let the robot do the work 🤖
-with HeyTelecomClient(email="your@email.com", password="your_password") as client:
-    client.login() # Knock knock 🚪
-    
-    # Gimme the data!
-    account_data = client.get_account_data()
-    
-    print(f"You have {len(account_data.products)} products.")
-    print(f"Latest invoice: €{account_data.latest_invoice.amount_eur} (Ouch? 💸)")
+try:
+    with HeyTelecomClient(email=..., password=...) as client:
+        client.login()
+        print(client.get_products())
+except AuthenticationError as e:
+    print("Auth problem:", e)
+except APIError as e:
+    print("API problem:", e, "status=", e.status_code)
 ```
+
+### Caching & tokens
+
+- Product inventory and latest invoice are cached for **60 seconds** (in-memory TTL).
+- Access tokens expire after ~1 hour; the client renews **~5 minutes early** using
+  `expires_in` from the token response, via a full email/password re-login
+  (the public web client does not expose a refresh-token grant).
+- After `clear_credentials()`, expired tokens raise `AuthenticationError` instead of re-login.
+
+---
 
 ## 🤖 How it Works
 
@@ -71,15 +132,18 @@ with HeyTelecomClient(email="your@email.com", password="your_password") as clien
 3. **The Grab**: Calls the same BFF JSON APIs the web app uses to get products, usage, and invoices.
 4. **The Result**: You get nice, clean Python objects to play with. No more parsing HTML yourself!
 
+See the [research folder](./research) for sanitized reverse-engineering notes.
+
 ---
 
 ## ✨ Features
 
 - **Auto Login**: Handles the OAuth2/PKCE auth flow automatically.
-- **Token Refresh**: Re-authenticates transparently when the access token expires.
+- **Token Refresh**: Re-authenticates transparently when the access token expires (while credentials remain available).
 - **Product Info**: Mobile, Internet, whatever you got.
-- **Usage Stats**: Data, Calls, SMS. Know when to stop scrolling TikTok.
-- **Invoices**: Track your latest invoice status.
+- **Usage Stats**: Data (GB), Calls, SMS.
+- **Invoices**: Latest + full list.
+- **Typed errors**: `APIError` / `AuthenticationError` with optional HTTP status.
 
 ---
 
@@ -95,9 +159,17 @@ Now I can graph my data usage and feel guilty about it in real-time.
 
 ## 🤝 Contributing
 
-Found a bug? Want to add a feature? PRs are welcome! Let's make this thing better together. 🎉
+Found a bug? Want to add a feature? PRs are welcome.
+
+```bash
+pip install -e ".[dev]"
+ruff check src/ tests/
+ruff format src/ tests/
+pytest
+```
+
+See [CHANGELOG.md](./CHANGELOG.md) for release notes.
 
 ---
 
 *Made with ❤️ and a lot of debugging.*
-

@@ -74,10 +74,22 @@ def format_msisdn(msisdn: str) -> str:
     return msisdn
 
 
-def _mbytes_to_gbytes(mb: float | None) -> float | None:
-    if mb is None:
+def _to_gbytes(amount: float | None, from_unit: str = "mb") -> float | None:
+    """Convert a data volume to gigabytes.
+
+    ``from_unit`` may be ``\"mb\"``/``\"mbyte\"`` (default) or ``\"gb\"``/``\"gbyte\"``.
+    """
+    if amount is None:
         return None
-    return round(mb / 1024, 2)
+    unit = (from_unit or "mb").lower()
+    if unit in ("gb", "gbyte", "gigabyte"):
+        return round(float(amount), 2)
+    return round(float(amount) / 1024, 2)
+
+
+# Backwards-compatible alias used by older call sites / tests.
+def _mbytes_to_gbytes(mb: float | None) -> float | None:
+    return _to_gbytes(mb, from_unit="mb")
 
 
 class TTLCache:

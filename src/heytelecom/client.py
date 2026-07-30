@@ -25,7 +25,6 @@ from .constants import (
     PRODUCT_TYPE_FIXED,
     PRODUCT_TYPE_MOBILE,
     REQUEST_TIMEOUT,
-    TOKEN_LIFETIME,
 )
 from .exceptions import APIError, AuthenticationError, HeyTelecomError
 from .models import AccountData, Contract, Invoice, Product, UsageData
@@ -40,15 +39,42 @@ logger = logging.getLogger(__name__)
 def _extract_amount(data: dict) -> float | None:
     """Extract a monetary amount from an API response dict, trying multiple keys."""
     candidates = (
-        data.get("amount", {}).get("value"),
+        data.get("amount", {}).get("value") if isinstance(data.get("amount"), dict) else None,
         data.get("amountEur"),
         data.get("totalAmount"),
-        data.get("invoiceAmount", {}).get("value"),
+        data.get("invoiceAmount", {}).get("value")
+        if isinstance(data.get("invoiceAmount"), dict)
+        else None,
     )
     for c in candidates:
         if c is not None:
             return round(float(c), 2)
     return None
+
+
+def _parse_invoice(data: dict) -> Invoice:
+    amount = _extract_amount(data)
+    status = data.get("status", "")
+    paid = status.lower() in ("betaald", "paid") if isinstance(status, str) else False
+    date = data.get("date") or data.get("referenceDate") or data.get("invoiceDate")
+    payment_dates = data.get("paymentDates")
+    due_date = (
+        data.get("dueDate")
+        or data.get("paymentDueDate")
+        or (payment_dates.get("endDate") if isinstance(payment_dates, dict) else None)
+    )
+    invoice_id = data.get("invoiceId") or data.get("invoiceNumber") or data.get("id")
+    if not invoice_id and date:
+        invoice_id = f"INV-{str(date).replace('-', '')}"
+
+    return Invoice(
+        invoice_id=str(invoice_id) if invoice_id is not None else None,
+        amount_eur=amount,
+        status=status if status != "" else None,
+        paid=paid,
+        date=date,
+        due_date=due_date,
+    )
 
 
 class HeyTelecomClient:
@@ -61,7 +87,7 @@ class HeyTelecomClient:
         self.password = password
         self.session = self._make_session()
         self.access_token: str | None = None
-        self._token_obtained_at: float = 0.0
+        self._token_expires_at: float = 0.0
         self._token_lock = threading.Lock()
         self._cache = TTLCache()
         weakref.finalize(self, self.session.close)
@@ -80,7 +106,7 @@ class HeyTelecomClient:
         session.headers.update(DEFAULT_HEADERS)
         return session
 
-    def __enter__(self) -> HeyTelecomClient:
+    def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -107,10 +133,10 @@ class HeyTelecomClient:
         if not self.email or not self.password:
             raise ValueError("Email and password required for login")
 
-        token, obtained_at = auth.login(self.session, self.email, self.password)
+        token, expires_at = auth.login(self.session, self.email, self.password)
         with self._token_lock:
             self.access_token = token
-            self._token_obtained_at = obtained_at
+            self._token_expires_at = expires_at
             self._cache.invalidate()
         return token
 
@@ -124,12 +150,19 @@ class HeyTelecomClient:
                 raise AuthenticationError(
                     "Not authenticated — call login() or pass email/password first."
                 )
-            if time.time() - self._token_obtained_at <= TOKEN_LIFETIME:
+            if time.time() < self._token_expires_at:
                 return self.access_token
-            logger.warning("Access token expired, re-authenticating")
-            token, obtained_at = auth.login(self.session, self.email, self.password)
+
+            if not self.email or not self.password:
+                raise AuthenticationError(
+                    "Access token expired and credentials are not available for "
+                    "re-authentication. Call login() again."
+                )
+
+            logger.info("Access token expired, re-authenticating")
+            token, expires_at = auth.login(self.session, self.email, self.password)
             self.access_token = token
-            self._token_obtained_at = obtained_at
+            self._token_expires_at = expires_at
             self._cache.invalidate()
             return self.access_token
 
@@ -142,22 +175,43 @@ class HeyTelecomClient:
             headers.update(extra)
         return headers
 
-    def _get(self, path: str, params=None, extra_headers=None) -> Any:
-        resp = self.session.get(
-            f"{API_BASE}{path}",
-            params=params,
-            headers=self._bff_headers(extra_headers),
-            timeout=REQUEST_TIMEOUT,
+    def _raise_for_response(self, resp: requests.Response, path: str) -> None:
+        """Map HTTP failures to library exceptions."""
+        if resp.ok:
+            return
+        status = resp.status_code
+        if status in (401, 403):
+            raise AuthenticationError(
+                f"Authentication failed for {path} (HTTP {status}). "
+                "Token may be invalid — try login() again."
+            )
+        body_preview = (resp.text or "")[:300]
+        raise APIError(
+            f"API request failed for {path} (HTTP {status}): {body_preview}",
+            status_code=status,
         )
-        resp.raise_for_status()
+
+    def _get(self, path: str, params=None, extra_headers=None) -> Any:
+        try:
+            resp = self.session.get(
+                f"{API_BASE}{path}",
+                params=params,
+                headers=self._bff_headers(extra_headers),
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise APIError(f"Network error requesting {path}: {exc}") from exc
+
+        self._raise_for_response(resp, path)
+
         try:
             return resp.json()
-        except requests.exceptions.JSONDecodeError:
+        except requests.exceptions.JSONDecodeError as exc:
             raise APIError(
                 f"Expected JSON from {path} but got content-type "
                 f"{resp.headers.get('content-type', '?')!r} — possible "
                 "Incapsula/Imperva challenge page."
-            )
+            ) from exc
 
     def _classify_product(
         self, product_type_raw: str, msisdn_raw: str
@@ -181,7 +235,8 @@ class HeyTelecomClient:
         msisdn_raw = item.get("MSISDN", "")
         tariff = item.get("tariffName", "")
         product_type_raw = item.get("productType", "")
-        price_value = item.get("price", {}).get("value")
+        price = item.get("price")
+        price_value = price.get("value") if isinstance(price, dict) else None
 
         product_type, phone_number, easy_switch_number, product_id = self._classify_product(
             product_type_raw, msisdn_raw
@@ -200,7 +255,7 @@ class HeyTelecomClient:
             product_type=product_type,
             phone_number=phone_number,
             easy_switch_number=easy_switch_number,
-            tariff=tariff,
+            tariff=tariff or None,
             contract=contract,
             usage=usage,
         )
@@ -209,17 +264,19 @@ class HeyTelecomClient:
         """Fetch all products and their usage data.
 
         Usage for each mobile line is fetched in parallel via a thread pool.
+
+        Raises:
+            APIError: When the product inventory request fails.
+            AuthenticationError: When authentication is missing or rejected.
         """
         if use_cache:
             cached = self._cache.get("products")
             if cached is not None:
                 return cached
 
-        try:
-            inventory = self._get(PATH_PRODUCT_INVENTORY)
-        except (requests.RequestException, HeyTelecomError) as exc:
-            logger.warning("Failed to fetch products: %s", exc)
-            return []
+        inventory = self._get(PATH_PRODUCT_INVENTORY)
+        if not isinstance(inventory, list):
+            raise APIError(f"Expected list from product inventory, got {type(inventory).__name__}")
 
         mobile_msisdns = [
             normalize_msisdn(item["MSISDN"])
@@ -242,88 +299,73 @@ class HeyTelecomClient:
         return products
 
     def get_latest_invoice(self, use_cache: bool = True) -> Invoice | None:
+        """Fetch the latest invoice.
+
+        Returns ``None`` when the account has no invoices.
+        Raises ``APIError`` / ``AuthenticationError`` on request failure.
+        """
         if use_cache:
             cached = self._cache.get("latest_invoice")
             if cached is not None:
                 return cached
 
-        try:
-            data = self._get(PATH_LATEST_INVOICE)
-        except (requests.RequestException, HeyTelecomError) as exc:
-            logger.warning("Failed to fetch latest invoice: %s", exc)
-            return None
-
+        data = self._get(PATH_LATEST_INVOICE)
         if not data:
             return None
 
-        amount = _extract_amount(data)
-        status = data.get("status", "")
-        paid = status.lower() in ("betaald", "paid") if isinstance(status, str) else False
-        date = data.get("date") or data.get("referenceDate") or data.get("invoiceDate")
-        due_date = data.get("dueDate") or data.get("paymentDueDate")
+        if not isinstance(data, dict):
+            raise APIError(f"Expected object from latest invoice, got {type(data).__name__}")
 
-        invoice_id = data.get("invoiceId") or data.get("id") or data.get("invoiceNumber")
-        if not invoice_id and date:
-            invoice_id = f"INV-{date.replace('-', '')}"
-
-        invoice = Invoice(
-            invoice_id=str(invoice_id) if invoice_id is not None else None,
-            amount_eur=amount,
-            status=status,
-            paid=paid,
-            date=date,
-            due_date=due_date,
-        )
+        invoice = _parse_invoice(data)
         self._cache.set("latest_invoice", invoice)
         return invoice
 
     def get_invoices(self) -> list[Invoice]:
+        """Fetch all invoices.
+
+        Raises ``APIError`` / ``AuthenticationError`` on request failure.
+        """
         data = self._get(PATH_INVOICES)
-        invoices: list[Invoice] = []
-        for item in data if isinstance(data, list) else []:
-            amount = _extract_amount(item)
-            status = item.get("status", "")
-            paid = status.lower() in ("betaald", "paid") if isinstance(status, str) else False
-            inv_id = item.get("invoiceNumber") or item.get("id")
-            date = item.get("referenceDate") or item.get("date")
-            payment_dates = item.get("paymentDates")
-            due_date = payment_dates.get("endDate") if isinstance(payment_dates, dict) else None
+        if not isinstance(data, list):
+            raise APIError(f"Expected list from invoices, got {type(data).__name__}")
 
-            invoices.append(
-                Invoice(
-                    invoice_id=str(inv_id) if inv_id is not None else None,
-                    amount_eur=amount,
-                    status=status,
-                    paid=paid,
-                    date=date,
-                    due_date=due_date,
-                )
-            )
-        return invoices
+        return [_parse_invoice(item) for item in data if isinstance(item, dict)]
 
-    def get_benefits(self) -> dict | None:
-        try:
-            return self._get(PATH_BENEFITS)
-        except (requests.RequestException, HeyTelecomError) as exc:
-            logger.warning("Failed to fetch benefits: %s", exc)
-            return None
+    def get_benefits(self) -> Any:
+        """Fetch account benefits.
 
-    def get_profile_products(self) -> dict | None:
-        try:
-            return self._get(PATH_PROFILE_PRODUCTS)
-        except (requests.RequestException, HeyTelecomError) as exc:
-            logger.warning("Failed to fetch profile products: %s", exc)
-            return None
+        Raises ``APIError`` / ``AuthenticationError`` on request failure.
+        """
+        return self._get(PATH_BENEFITS)
+
+    def get_profile_products(self) -> Any:
+        """Fetch profile products.
+
+        Raises ``APIError`` / ``AuthenticationError`` on request failure.
+        """
+        return self._get(PATH_PROFILE_PRODUCTS)
 
     def get_account_data(self, use_cache: bool = True) -> AccountData:
-        products = self.get_products(use_cache=use_cache)
-        invoice = self.get_latest_invoice(use_cache=use_cache)
+        """Fetch products and latest invoice (in parallel when uncached)."""
+        if use_cache:
+            cached_products = self._cache.get("products")
+            cached_invoice = self._cache.get("latest_invoice")
+            if cached_products is not None and cached_invoice is not None:
+                return AccountData(products=cached_products, latest_invoice=cached_invoice)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            products_future = pool.submit(self.get_products, use_cache)
+            invoice_future = pool.submit(self.get_latest_invoice, use_cache)
+            products = products_future.result()
+            invoice = invoice_future.result()
+
         return AccountData(products=products, latest_invoice=invoice)
 
     def invalidate_cache(self) -> None:
         self._cache.invalidate()
 
     def _fetch_usage(self, msisdn: str) -> UsageData | None:
+        """Fetch usage for one MSISDN. Failures are logged and return None."""
         try:
             data = self._get(
                 PATH_USAGE,
@@ -336,6 +378,6 @@ class HeyTelecomClient:
 
         try:
             return parse_usage_response(data)
-        except (ValueError, TypeError, KeyError) as exc:
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
             logger.warning("Failed to parse usage for %s: %s", msisdn, exc)
             return None

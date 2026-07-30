@@ -9,6 +9,7 @@ from heytelecom.utils import (
     _b64url,
     _generate_pkce,
     _mbytes_to_gbytes,
+    _to_gbytes,
     format_msisdn,
     normalize_msisdn,
 )
@@ -84,6 +85,26 @@ def test_mbytes_to_gbytes_handles_none():
 
 def test_mbytes_to_gbytes_rounds_correctly():
     assert _mbytes_to_gbytes(100) == 0.1
+
+
+def test_to_gbytes_from_gb_passthrough():
+    assert _to_gbytes(5.25, from_unit="gb") == 5.25
+    assert _to_gbytes(5.25, from_unit="GByte") == 5.25
+    assert _to_gbytes(None, from_unit="gb") is None
+
+
+def test_to_gbytes_from_mb():
+    assert _to_gbytes(1024, from_unit="mb") == 1.0
+
+
+def test_ttlcache_maxsize_evicts_oldest():
+    cache = TTLCache(ttl=60, maxsize=2)
+    cache.set("a", 1)
+    cache.set("b", 2)
+    cache.set("c", 3)
+    assert cache.get("a") is None
+    assert cache.get("b") == 2
+    assert cache.get("c") == 3
 
 
 def test_ttlcache_get_set():
