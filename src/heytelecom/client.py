@@ -1,300 +1,124 @@
-"""Hey Telecom client using requests + OAuth2/PKCE (no browser required)."""
 from __future__ import annotations
 
-import base64
-import hashlib
 import logging
-import secrets
 import time
-from typing import Dict, Optional, List
-from urllib.parse import parse_qs, urlencode, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-log = logging.getLogger(__name__)
-
-from .models import Product, Contract, UsageData, Invoice, AccountData
-
-
-# --------------------------------------------------------------------------- #
-# Constants (public client-side values from the web app)
-# --------------------------------------------------------------------------- #
-CLIENT_ID = "4x5cSOWeuG"
-REDIRECT_URI = "https://ecare.heytelecom.be/index.html"
-SCOPE = "openid ecare"
-
-OPENID_BASE = "https://openid.heytelecom.be"
-API_BASE = "https://api.heytelecom.be"
-
-API_KEY_LOGIN = "ST70c4jIzkKpGTf0cIGbVZLRN7VMhGl0mzLp8D3vEe79oNaK"
-API_KEY_DATA = "KEQRymGhNEonxo79zqM40tphE7zk5NxHOGxjbVsrzsbrkpIs"
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+from . import auth
+from .constants import (
+    API_BASE,
+    BFF_BASE_HEADERS,
+    DEFAULT_HEADERS,
+    PATH_BENEFITS,
+    PATH_INVOICES,
+    PATH_LATEST_INVOICE,
+    PATH_PRODUCT_INVENTORY,
+    PATH_PROFILE_PRODUCTS,
+    PATH_USAGE,
+    PRODUCT_TYPE_FIXED,
+    PRODUCT_TYPE_MOBILE,
+    REQUEST_TIMEOUT,
+    TOKEN_LIFETIME,
 )
-SEC_CH_UA = '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"'
+from .models import AccountData, Contract, Invoice, Product, UsageData
+from .usage import parse_usage_response
+from .utils import TTLCache, format_msisdn, normalize_msisdn
+
+logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- #
-# PKCE helpers
-# --------------------------------------------------------------------------- #
-def _b64url(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+def _extract_amount(data: dict) -> float | None:
+    patterns = [
+        lambda d: d.get("amount", {}).get("value"),
+        lambda d: d.get("amountEur"),
+        lambda d: d.get("totalAmount"),
+        lambda d: d.get("invoiceAmount", {}).get("value"),
+    ]
+    for pattern in patterns:
+        amount = pattern(data)
+        if amount is not None:
+            return round(float(amount), 2)
+    return None
 
 
-def _generate_pkce() -> tuple[str, str]:
-    """Return (code_verifier, code_challenge) using the S256 method."""
-    code_verifier = _b64url(secrets.token_bytes(48))
-    code_challenge = _b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
-    return code_verifier, code_challenge
-
-
-def _normalize_msisdn(msisdn: str) -> str:
-    """04XXXXXXXX -> 324XXXXXXXX (drop leading 0, prefix country code 32)."""
-    msisdn = msisdn.strip()
-    if msisdn.startswith("0") and not msisdn.startswith("00"):
-        return "32" + msisdn[1:]
-    return msisdn
-
-
-def _format_msisdn(msisdn: str) -> str:
-    """324XXXXXXXX -> 04XXXXXXXX (prefix with 0, drop country code)."""
-    msisdn = msisdn.strip()
-    if msisdn.startswith("32") and len(msisdn) > 2:
-        return "0" + msisdn[2:]
-    return msisdn
-
-
-# --------------------------------------------------------------------------- #
-# Client
-# --------------------------------------------------------------------------- #
 class HeyTelecomClient:
-    """Client for interacting with Hey Telecom accounts.
-
-    Uses the same OAuth2/PKCE + BFF API flow as the web app, but without a
-    browser.  Supports the context-manager protocol::
-
-        with HeyTelecomClient(email="...", password="...") as client:
-            client.login()
-            data = client.get_account_data()
-    """
-
     def __init__(
         self,
-        email: Optional[str] = None,
-        password: Optional[str] = None,
-        **_kwargs,
+        email: str | None = None,
+        password: str | None = None,
+        max_workers: int = 4,
     ):
-        """Initialise the client.
-
-        Args:
-            email: Account email address.
-            password: Account password.
-            **_kwargs: Ignored (kept for backward compatibility with the old
-                Playwright-based constructor which accepted ``user_data_dir``
-                and ``auto_install``).
-        """
         self.email = email
         self.password = password
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "nl-BE,nl;q=0.9",
-                "sec-ch-ua": SEC_CH_UA,
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-            }
-        )
-        self.access_token: Optional[str] = None
+        self.session = self._make_session()
+        self.access_token: str | None = None
         self._token_obtained_at: float = 0.0
+        self._cache = TTLCache()
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
-    # -- context manager ---------------------------------------------------- #
+    @staticmethod
+    def _make_session() -> requests.Session:
+        session = requests.Session()
+        retry = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist={502, 503, 504},
+            allowed_methods={"GET"},
+        )
+        session.mount("https://", HTTPAdapter(max_retries=retry))
+        session.headers.update(DEFAULT_HEADERS)
+        return session
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def close(self):
-        """Close the underlying requests session."""
+    def close(self) -> None:
+        self._executor.shutdown(wait=False)
         self.session.close()
 
-    # ====================================================================== #
-    # OAuth2 / PKCE login flow (from test.py)
-    # ====================================================================== #
-
     def login(self) -> None:
-        """Run the full OAuth2/PKCE + credential login flow."""
         if not self.email or not self.password:
             raise ValueError("Email and password required for login")
 
-        self.session.cookies.clear()
-        code_verifier, code_challenge = _generate_pkce()
-        state = nonce = _b64url(secrets.token_bytes(33))
-
-        transaction_id = self._start_authorization(state, nonce, code_challenge)
-        return_uri = self._build_return_uri(
-            state, nonce, code_challenge, transaction_id
-        )
-        authorize_url = self._login(return_uri)
-        code = self._collect_code(authorize_url)
-        self.access_token = self._exchange_token(code, code_verifier)
-        self._token_obtained_at = time.time()
-
-    def _start_authorization(self, state, nonce, code_challenge) -> str:
-        params = {
-            "response_type": "code",
-            "client_id": CLIENT_ID,
-            "state": state,
-            "redirect_uri": REDIRECT_URI,
-            "scope": SCOPE,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "nonce": nonce,
-            "ui_locales": "nl",
-        }
-        resp = self.session.get(
-            f"{OPENID_BASE}/oidc/authorize",
-            params=params,
-            allow_redirects=False,
-        )
-        location = resp.headers.get("Location", "")
-        return_uri = parse_qs(urlparse(location).query).get("returnUri", [""])[0]
-        transaction_id = parse_qs(urlparse(return_uri).query).get(
-            "transactionId", [""]
-        )[0]
-        if not transaction_id:
-            raise RuntimeError(
-                f"Could not obtain transactionId (status {resp.status_code}, "
-                f"location={location!r})"
-            )
-        return transaction_id
-
-    @staticmethod
-    def _build_return_uri(state, nonce, code_challenge, transaction_id) -> str:
-        query = urlencode(
-            {
-                "response_type": "code",
-                "client_id": CLIENT_ID,
-                "state": state,
-                "redirect_uri": REDIRECT_URI,
-                "scope": SCOPE,
-                "code_challenge": code_challenge,
-                "code_challenge_method": "S256",
-                "nonce": nonce,
-                "ui_locales": "nl",
-                "transactionId": transaction_id,
-                "redirectedToAuthForm": "",
-            }
-        )
-        return f"{OPENID_BASE}/oidc/authorize?{query}"
-
-    def _login(self, return_uri: str) -> str:
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "Origin": "https://auth.heytelecom.be",
-            "Referer": "https://auth.heytelecom.be/",
-            "x-api-key": API_KEY_LOGIN,
-            "x-channel-id": "web",
-            "x-usecase-id": "login-email-pwd",
-            "x-usersession-id": "".join(
-                secrets.choice("0123456789") for _ in range(30)
-            ),
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-site",
-        }
-        resp = self.session.post(
-            f"{API_BASE}/api/bff/auth/v1/login/email",
-            data={
-                "email": self.email,
-                "password": self.password,
-                "returnUri": return_uri,
-            },
-            headers=headers,
-            allow_redirects=False,
-        )
-        location = resp.headers.get("Location")
-        if not location:
-            raise RuntimeError(
-                f"Login failed (status {resp.status_code}). "
-                "Check credentials / Incapsula challenge."
-            )
-        return location
-
-    def _collect_code(self, authorize_url: str) -> str:
-        resp = self.session.get(authorize_url, allow_redirects=False)
-        location = resp.headers.get("Location", "")
-        code = parse_qs(urlparse(location).query).get("code", [""])[0]
-        if not code:
-            raise RuntimeError(
-                f"No authorization code returned (status {resp.status_code}, "
-                f"location={location!r})"
-            )
-        return code
-
-    def _exchange_token(self, code: str, code_verifier: str) -> str:
-        resp = self.session.post(
-            f"{OPENID_BASE}/oidc/token",
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-                "code_verifier": code_verifier,
-                "client_id": CLIENT_ID,
-            },
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://ecare.heytelecom.be",
-                "Referer": "https://ecare.heytelecom.be/",
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["access_token"]
-
-    # ====================================================================== #
-    # Authenticated BFF data calls
-    # ====================================================================== #
-
-    TOKEN_LIFETIME = 3300  # ~55 min, slightly under the 1-hour OAuth2 lifetime
+        self._cache.invalidate()
+        token, obtained_at = auth.login(self.session, self.email, self.password)
+        self.access_token = token
+        self._token_obtained_at = obtained_at
 
     def _ensure_token(self) -> None:
-        """Re-login if the access token has expired."""
         if not self.access_token:
-            return
+            raise RuntimeError(
+                "Not authenticated — call login() or pass email/password to the constructor first."
+            )
         age = time.time() - self._token_obtained_at
-        if age > self.TOKEN_LIFETIME:
-            log.warning("Access token expired (%.0fs old), re-authenticating", age)
+        if age > TOKEN_LIFETIME:
+            logger.warning("Access token expired (%.0fs old), re-authenticating", age)
             self.login()
 
-    def _bff_headers(self, extra: Optional[dict] = None) -> dict:
+    def _bff_headers(self, extra: dict | None = None) -> dict[str, str]:
         self._ensure_token()
-        if not self.access_token:
-            raise RuntimeError("Not authenticated - call login() first.")
-        headers = {
-            "Accept": "application/json",
+        headers: dict[str, str] = {
+            **BFF_BASE_HEADERS,
             "Authorization": f"Bearer {self.access_token}",
-            "Content-Language": "nl",
-            "Origin": "https://ecare.heytelecom.be",
-            "Referer": "https://ecare.heytelecom.be/",
-            "x-api-key": API_KEY_DATA,
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-site",
         }
         if extra:
             headers.update(extra)
         return headers
 
-    def _get(self, path: str, params=None, extra_headers=None):
+    def _get(self, path: str, params=None, extra_headers=None) -> Any:
         resp = self.session.get(
             f"{API_BASE}{path}",
             params=params,
             headers=self._bff_headers(extra_headers),
+            timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         try:
@@ -306,53 +130,64 @@ class HeyTelecomClient:
                 "Incapsula/Imperva challenge page."
             )
 
-    # ====================================================================== #
-    # Public API — same interface as the old Playwright client
-    # ====================================================================== #
+    def get_products(self, use_cache: bool = True) -> list[Product]:
+        if use_cache:
+            cached = self._cache.get("products")
+            if cached is not None:
+                return cached
 
-    def get_products(self) -> List[Product]:
-        """Get all products from the account.
+        inventory = self._get(PATH_PRODUCT_INVENTORY)
+        products: list[Product] = []
 
-        Returns:
-            List of Product objects (mobile lines, internet, ...).
-        """
-        inventory = self._get("/api/bff/product-inventory/v1/productInventory")
-        products: List[Product] = []
+        mobile_msisdns = [
+            normalize_msisdn(item.get("MSISDN", ""))
+            for item in inventory
+            if item.get("productType") == PRODUCT_TYPE_MOBILE
+        ]
+
+        usage_results: dict[str, UsageData | None] = {}
+        if mobile_msisdns:
+            fut_map = {
+                self._executor.submit(self._fetch_usage, msisdn): msisdn
+                for msisdn in mobile_msisdns
+            }
+            for fut in as_completed(fut_map):
+                msisdn = fut_map[fut]
+                try:
+                    usage_results[msisdn] = fut.result()
+                except Exception as exc:
+                    logger.warning("Failed to fetch usage for %s: %s", msisdn, exc)
+                    usage_results[msisdn] = None
 
         for item in inventory:
             msisdn_raw = item.get("MSISDN", "")
             tariff = item.get("tariffName", "")
             product_type_raw = item.get("productType", "")
-            price_info = item.get("price", {})
-            price_value = price_info.get("value")
+            price_value = item.get("price", {}).get("value")
 
-            # Map API productType to old library conventions
-            if product_type_raw == "M":
+            if product_type_raw == PRODUCT_TYPE_MOBILE:
                 product_type = "mobile"
-                phone_number = _format_msisdn(msisdn_raw)
+                phone_number = format_msisdn(msisdn_raw)
                 product_id = f"mobile_{msisdn_raw}"
                 easy_switch_number = None
-            elif product_type_raw == "F":
+            elif product_type_raw == PRODUCT_TYPE_FIXED:
                 product_type = "internet"
                 phone_number = None
                 easy_switch_number = msisdn_raw
                 product_id = f"internet_{msisdn_raw}"
             else:
                 product_type = product_type_raw or "unknown"
-                phone_number = _format_msisdn(msisdn_raw) if msisdn_raw else None
+                phone_number = format_msisdn(msisdn_raw) if msisdn_raw else None
                 easy_switch_number = msisdn_raw if not phone_number else None
                 product_id = f"{product_type}_{msisdn_raw}"
 
-            # Build contract
             contract = None
             if price_value is not None:
-                contract = Contract(price_per_month_eur=float(price_value))
+                contract = Contract(price_per_month_eur=round(float(price_value), 2))
 
-            # Fetch usage for mobile lines
             usage = None
-            if product_type_raw == "M":
-                msisdn_intl = _normalize_msisdn(msisdn_raw)
-                usage = self._fetch_usage(msisdn_intl)
+            if product_type_raw == PRODUCT_TYPE_MOBILE:
+                usage = usage_results.get(normalize_msisdn(msisdn_raw))
 
             products.append(
                 Product(
@@ -366,140 +201,100 @@ class HeyTelecomClient:
                 )
             )
 
+        self._cache.set("products", products)
         return products
 
-    def get_latest_invoice(self) -> Optional[Invoice]:
-        """Get the latest invoice.
+    def get_latest_invoice(self, use_cache: bool = True) -> Invoice | None:
+        if use_cache:
+            cached = self._cache.get("latest_invoice")
+            if cached is not None:
+                return cached
 
-        Returns:
-            Invoice object or None if no invoice data is available.
-        """
         try:
-            data = self._get("/api/bff/invoice/v1/latest")
+            data = self._get(PATH_LATEST_INVOICE)
         except (requests.RequestException, RuntimeError) as exc:
-            log.warning("Failed to fetch latest invoice: %s", exc)
+            logger.warning("Failed to fetch latest invoice: %s", exc)
             return None
 
         if not data:
             return None
 
-        amount = data.get("amount", {}).get("value")
-        if amount is None:
-            amount = data.get("amountEur") or data.get("totalAmount")
-        if amount is not None:
-            amount = float(amount)
-
+        amount = _extract_amount(data)
         status = data.get("status", "")
         paid = status.lower() in ("betaald", "paid") if isinstance(status, str) else False
-
-        date = data.get("date") or data.get("invoiceDate")
+        date = data.get("date") or data.get("referenceDate") or data.get("invoiceDate")
         due_date = data.get("dueDate") or data.get("paymentDueDate")
 
-        invoice_id = data.get("invoiceId") or data.get("id")
+        invoice_id = data.get("invoiceId") or data.get("id") or data.get("invoiceNumber")
         if not invoice_id and date:
             invoice_id = f"INV-{date.replace('-', '')}"
 
-        return Invoice(
-            invoice_id=invoice_id,
+        invoice = Invoice(
+            invoice_id=str(invoice_id) if invoice_id is not None else None,
             amount_eur=amount,
             status=status,
             paid=paid,
             date=date,
             due_date=due_date,
         )
+        self._cache.set("latest_invoice", invoice)
+        return invoice
 
-    def get_account_data(self) -> AccountData:
-        """Get all account data including products and latest invoice.
+    def get_invoices(self) -> list[Invoice]:
+        data = self._get(PATH_INVOICES)
+        invoices: list[Invoice] = []
+        for item in data if isinstance(data, list) else []:
+            amount = _extract_amount(item)
+            status = item.get("status", "")
+            paid = status.lower() in ("betaald", "paid") if isinstance(status, str) else False
+            inv_id = item.get("invoiceNumber") or item.get("id")
+            date = item.get("referenceDate") or item.get("date")
+            payment_dates = item.get("paymentDates")
+            due_date = payment_dates.get("endDate") if isinstance(payment_dates, dict) else None
 
-        Returns:
-            AccountData object with all information.
-        """
-        products = self.get_products()
-        invoice = self.get_latest_invoice()
+            invoices.append(
+                Invoice(
+                    invoice_id=str(inv_id) if inv_id is not None else None,
+                    amount_eur=amount,
+                    status=status,
+                    paid=paid,
+                    date=date,
+                    due_date=due_date,
+                )
+            )
+        return invoices
 
-        return AccountData(
-            products=products,
-            latest_invoice=invoice,
-        )
+    def get_benefits(self) -> dict | None:
+        try:
+            return self._get(PATH_BENEFITS)
+        except (requests.RequestException, RuntimeError) as exc:
+            logger.warning("Failed to fetch benefits: %s", exc)
+            return None
 
-    # ====================================================================== #
-    # Usage (private)
-    # ====================================================================== #
+    def get_profile_products(self) -> dict | None:
+        try:
+            return self._get(PATH_PROFILE_PRODUCTS)
+        except (requests.RequestException, RuntimeError) as exc:
+            logger.warning("Failed to fetch profile products: %s", exc)
+            return None
 
-    def _fetch_usage(self, msisdn: str) -> Optional[UsageData]:
-        """Fetch consumption/balance for a mobile line."""
+    def get_account_data(self, use_cache: bool = True) -> AccountData:
+        products = self.get_products(use_cache=use_cache)
+        invoice = self.get_latest_invoice(use_cache=use_cache)
+        return AccountData(products=products, latest_invoice=invoice)
+
+    def invalidate_cache(self) -> None:
+        self._cache.invalidate()
+
+    def _fetch_usage(self, msisdn: str) -> UsageData | None:
         try:
             data = self._get(
-                "/api/bff/info-consumption/v1/usage",
+                PATH_USAGE,
                 params={"timestamp": int(time.time() * 1000)},
                 extra_headers={"x-req-msisdn": msisdn},
             )
         except (requests.RequestException, RuntimeError) as exc:
-            log.warning("Failed to fetch usage for %s: %s", msisdn, exc)
+            logger.warning("Failed to fetch usage for %s: %s", msisdn, exc)
             return None
 
-        balances = data.get("BalancePresentation", [])
-        if not balances:
-            return None
-
-        period = None
-        date_range = data.get("dateRange") or data.get("period")
-        if date_range:
-            period = {
-                "start": date_range.get("start"),
-                "end": date_range.get("end"),
-            }
-
-        calls_used = 0.0
-        calls_unlimited = False
-        sms_used = 0
-        sms_unlimited = False
-        data_used_gb: Optional[float] = None
-        data_limit_gb: Optional[float] = None
-        data_unlimited = False
-
-        for bal in balances:
-            name = (bal.get("Name") or "").lower()
-            consumed = bal.get("ConsumedAmount", {})
-            consumed_val = consumed.get("Amount")
-            unit = (bal.get("Unit") or "").lower()
-            category = (bal.get("Category") or "").lower()
-
-            if consumed_val is not None:
-                consumed_val = float(consumed_val)
-
-            if "data" in name or "internet" in category:
-                data_used_gb = consumed_val
-                data_unlimited = "onbeperkt" in name or "unlimited" in name
-                limit = bal.get("LimitAmount")
-                if limit is not None:
-                    data_limit_gb = float(limit)
-            elif "minuut" in name or "call" in category or "bel" in name:
-                calls_used = consumed_val or 0.0
-                calls_unlimited = "onbeperkt" in name or "unlimited" in name
-            elif "sms" in name or "mms" in name or "sms" in category:
-                sms_used = int(consumed_val or 0)
-                sms_unlimited = "onbeperkt" in name or "unlimited" in name
-
-        usage_dict: Dict = {}
-        if data_used_gb is not None or data_limit_gb is not None:
-            usage_dict["data"] = {
-                "used": data_used_gb,
-                "limit": data_limit_gb,
-                "unlimited": data_unlimited,
-            }
-        if calls_used or calls_unlimited:
-            usage_dict["calls"] = {
-                "used": calls_used,
-                "unlimited": calls_unlimited,
-            }
-        if sms_used or sms_unlimited:
-            usage_dict["sms_mms"] = {
-                "used": sms_used,
-                "unlimited": sms_unlimited,
-            }
-
-        if not usage_dict:
-            return None
-
-        return UsageData(period=period, **usage_dict)
+        return parse_usage_response(data)

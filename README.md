@@ -61,7 +61,7 @@ with HeyTelecomClient(email="your@email.com", password="your_password") as clien
     account_data = client.get_account_data()
     
     print(f"You have {len(account_data.products)} products.")
-    print(f"Latest invoice: €{account_data.billing.latest_invoice.amount_eur} (Ouch? 💸)")
+    print(f"Latest invoice: €{account_data.latest_invoice.amount_eur} (Ouch? 💸)")
 ```
 
 ## 🤖 How it Works

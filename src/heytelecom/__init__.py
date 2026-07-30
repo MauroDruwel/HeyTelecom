@@ -8,7 +8,7 @@ requests + OAuth2/PKCE (no browser required).
 __version__ = "0.2.0"
 
 from .client import HeyTelecomClient
-from .models import Product, Contract, UsageData, Invoice, AccountData
+from .models import AccountData, Contract, Invoice, Product, UsageData
 
 __all__ = [
     "HeyTelecomClient",
