@@ -138,6 +138,24 @@ def test_parse_data_with_amount_of_forfeit_as_limit():
     assert result.data["limit"] == 10.0
 
 
+def test_parse_period_from_balance_entries():
+    data = {
+        "BalancePresentation": [
+            {
+                "Name": "Surfvolume",
+                "Unit": "MByte",
+                "ConsumedAmount": {"Amount": 1024},
+                "Category": "Data",
+                "PreviousInvoiceClosing": "2025-01-01T00:00:00Z",
+                "NextInvoiceClosing": "2025-01-31T23:59:59Z",
+            },
+        ],
+    }
+    result = parse_usage_response(data)
+    assert result is not None
+    assert result.period == {"start": "2025-01-01", "end": "2025-01-31"}
+
+
 def test_parse_data_used_none():
     entry = {
         "Name": "Surfvolume",

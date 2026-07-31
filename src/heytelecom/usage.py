@@ -132,12 +132,28 @@ def parse_usage_response(data: dict) -> UsageData | None:
         return None
 
     period = None
+    # Try top-level dateRange/period first
     date_range = data.get("dateRange") or data.get("period")
     if date_range and isinstance(date_range, dict):
         period = {
             "start": date_range.get("start"),
             "end": date_range.get("end"),
         }
+    else:
+        # Extract from first data balance entry (PreviousInvoiceClosing/NextInvoiceClosing)
+        for bal in balances:
+            if not isinstance(bal, dict):
+                continue
+            if bal.get("PreviousInvoiceClosing") or bal.get("NextInvoiceClosing"):
+                start = bal.get("PreviousInvoiceClosing")
+                end = bal.get("NextInvoiceClosing")
+                # Parse dates if they're in ISO format
+                if start:
+                    start = start.split("T")[0] if "T" in start else start
+                if end:
+                    end = end.split("T")[0] if "T" in end else end
+                period = {"start": start, "end": end}
+                break
 
     usage_dict: dict[str, Any] = {}
 
