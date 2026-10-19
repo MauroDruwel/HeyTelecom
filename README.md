@@ -24,6 +24,9 @@
 
 > **Automate your Hey! Telecom account. Get usage, invoices, and more without lifting a finger.**
 
+> ⚠️ **Project On Hold / Blocked by Upstream 2FA**
+> Hey! Telecom (`auth.heytelecom.be` / `ecare.heytelecom.be`) recently made SMS two-factor authentication mandatory on login. Because access tokens expire in 1 hour and no refresh tokens are provided by their web portal, automated headless logins are currently blocked. This repository and the Home Assistant integration are paused until an alternative authentication flow or long-lived token mechanism is found.
+
 > ⚠️ Unofficial library. Use against **your own** account only and respect Hey Telecom's terms of service. The portal sits behind Imperva/Incapsula; automated access may occasionally fail.
 
 ---
